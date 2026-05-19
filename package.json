@@ -1,0 +1,22 @@
+{
+  "name": "archer",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "archer": "./src/main.ts"
+  },
+  "scripts": {
+    "dev": "bun run src/main.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "build": "bun build ./src/main.ts --compile --outfile archer"
+  },
+  "dependencies": {
+    "@opencode-ai/sdk": "^1.15.5"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.9.3"
+  }
+}
