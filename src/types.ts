@@ -6,6 +6,7 @@ export type RunOptions = {
   resumeRunID: string
   keepRunDir: boolean
   modelOverride: string
+  tui: boolean
   humanReview: boolean
   emulatorID: string
   appRunCommand: string

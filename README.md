@@ -79,10 +79,13 @@ archer --prompt-file prd.md --skip security,design
 # force a different model for all phases
 archer --prompt-file prd.md --model anthropic/claude-sonnet-4-6
 
+# disable the OpenTUI progress footer
+archer --prompt-file prd.md --no-tui
+
 # disable the post-implementer manual checkpoint
 archer --prompt-file prd.md --no-human-review
 
-# launch a specific Flutter emulator and app command during manual review
+# prefer a specific Flutter emulator and app command during manual review auto-start
 archer --prompt-file prd.md --emulator Pixel_8 --app-run-command "flutter run -d emulator-5554"
 
 # resume a failed run
@@ -97,6 +100,10 @@ archer --prompt-file prd.md --base develop
 # include existing local changes in the first commit of the pipeline
 archer --prompt-file prd.md --include-dirty --max-attempts 1
 ```
+
+In interactive terminals, Archer shows an OpenTUI split-footer with live harness progress across phases. Use `--no-tui` to fall back to plain logs.
+
+During `human-review`, Archer waits 10 seconds for an explicit action. If nobody answers, it automatically starts the preferred Flutter emulator, or the first emulator returned by `flutter emulators --machine`, then runs the app command in the target worktree so the implementation is compiled and ready to test when the user returns.
 
 ## Efficient Attachments
 

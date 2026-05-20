@@ -48,6 +48,7 @@ export function parseArgs(argv: string[]): ParsedArgs {
     resumeRunID: "",
     keepRunDir: false,
     modelOverride: "",
+    tui: Boolean(process.stdout.isTTY && process.stderr.isTTY),
     humanReview: Boolean(process.stdin.isTTY && process.stdout.isTTY),
     emulatorID: "",
     appRunCommand: "flutter run",
@@ -109,6 +110,12 @@ export function parseArgs(argv: string[]): ParsedArgs {
         break
       case "--model":
         parsed.modelOverride = takeValue()
+        break
+      case "--tui":
+        parsed.tui = true
+        break
+      case "--no-tui":
+        parsed.tui = false
         break
       case "--human-review":
         parsed.humanReview = true
@@ -183,9 +190,11 @@ Flags:
   --keep-run-dir           Don't delete the run dir when done
   --include-dirty          Include existing changes in the first commit (requires --max-attempts 1)
   --model <provider/model> Force a model for all phases
-  --human-review           Pause after implementer for manual review (default in interactive terminals)
+  --tui                    Show visual phase progress (default in interactive terminals)
+  --no-tui                 Disable visual phase progress
+  --human-review           Pause after implementer; auto-start app after 10s (default in interactive terminals)
   --no-human-review        Disable the post-implementer manual gate
-  --emulator <id>          Launch this Flutter emulator before manual review
+  --emulator <id>          Preferred Flutter emulator for manual review auto-start
   --app-run-command <cmd>  Command used to run the app during manual review (default: flutter run)
   --no-app-run             Don't launch the app automatically during manual review
   --interactive-model <m>  Model used by manual OpenCode iterations (default: ${defaultGptModel})

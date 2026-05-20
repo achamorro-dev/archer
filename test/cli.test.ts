@@ -44,6 +44,7 @@ describe("cli parsing", () => {
   test("parses human review flags", () => {
     const parsed = parseArgs([
       "--human-review",
+      "--no-tui",
       "--emulator",
       "Pixel_8",
       "--app-run-command",
@@ -56,6 +57,7 @@ describe("cli parsing", () => {
     ])
 
     expect(parsed.humanReview).toBe(true)
+    expect(parsed.tui).toBe(false)
     expect(parsed.emulatorID).toBe("Pixel_8")
     expect(parsed.appRunCommand).toBe("flutter run -d emulator-5554")
     expect(parsed.interactiveModel).toBe("openai/gpt-5.5-pro")

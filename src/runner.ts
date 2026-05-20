@@ -10,6 +10,7 @@ import { runHumanReviewGate } from "./human"
 import { log } from "./log"
 import { startOpencode } from "./opencode"
 import { phases } from "./phases"
+import { createProgressUI, noopProgress, type ProgressPhase, type ProgressUI } from "./progress"
 import type { Phase, RunOptions } from "./types"
 import { cleanupWorkspace, createWorkspace, resumeWorkspace, type Workspace, writeSummary } from "./workspace"
 
@@ -22,30 +23,38 @@ export async function run(options: RunOptions) {
 
   let runErr: unknown
   let opencode: Awaited<ReturnType<typeof startOpencode>> | undefined
+  let progress: ProgressUI = noopProgress
 
   try {
+    progress = await createProgressUI(progressPhases(options), options.tui)
+    progress.start(workspace.runID, options.targetDir)
     log.info(`Run ${workspace.runID} - dir: ${workspace.dir}`)
 
     const extraFiles = await fileParts(options.files, options.targetDir, "error")
     if (extraFiles.length > 0) log.info(`User attachments: ${extraFiles.map((file) => file.filename).join(", ")}`)
 
     opencode = await startOpencode(opencodeConfig(workspace.dir))
+    progress.message("opencode SDK ready")
     log.info(`opencode SDK ready at ${opencode.url}`)
 
     for (const phase of phases) {
       if (shouldSkip(phase.name, options)) {
+        progress.phaseSkipped(phase.name)
+        if (phase.name === "implementer" && options.humanReview) progress.phaseSkipped("human-review")
         log.warn(`[${phase.name}] skipped by flag`)
         continue
       }
-      await runPhase(opencode.client, workspace, phase, options, extraFiles)
-      if (phase.name === "implementer") await runHumanReviewGate(workspace, options, opencode.url)
+      await runPhase(opencode.client, workspace, phase, options, extraFiles, progress)
+      if (phase.name === "implementer") await runHumanReviewGate(workspace, options, opencode.url, progress)
     }
 
+    progress.message("writing run summary")
     await writeSummary(workspace, summaryReportNames(options.humanReview))
   } catch (error) {
     runErr = error
     throw error
   } finally {
+    progress.stop()
     opencode?.close()
 
     if (runErr || options.keepRunDir) {
@@ -62,15 +71,23 @@ async function runPhase(
   phase: Phase,
   options: RunOptions,
   extraFiles: FilePartInput[],
+  progress: ProgressUI,
 ) {
+  progress.phaseStarted(phase.name, phase.description)
   log.section(`${phase.name} - ${phase.description}`)
 
-  const prepared = await preparePhaseRun(workspace, phase, options, extraFiles)
-  const baseline = await createCleanRepoSnapshot(options.targetDir)
-  const assistantText = await runPhaseWithRetries(client, workspace, phase, options.targetDir, prepared, baseline)
+  try {
+    const prepared = await preparePhaseRun(workspace, phase, options, extraFiles)
+    const baseline = await createCleanRepoSnapshot(options.targetDir)
+    const assistantText = await runPhaseWithRetries(client, workspace, phase, options.targetDir, prepared, baseline, progress)
 
-  const reportAbs = await persistPhaseReport(workspace, phase, assistantText)
-  await commitPhase(phase, reportAbs, options.targetDir)
+    const reportAbs = await persistPhaseReport(workspace, phase, assistantText)
+    await commitPhase(phase, reportAbs, options.targetDir)
+    progress.phaseCompleted(phase.name, "report saved and commit checked")
+  } catch (error) {
+    progress.phaseFailed(phase.name, formatSdkError(error))
+    throw error
+  }
 }
 
 type PreparedPhaseRun = {
@@ -107,6 +124,7 @@ async function runPhaseWithRetries(
   targetDir: string,
   prepared: PreparedPhaseRun,
   baseline: RepoSnapshot | undefined,
+  progress: ProgressUI,
 ) {
   if (!baseline && prepared.maxAttempts > 1) {
     throw new Error(`[${phase.name}] can't retry with dirty working tree; use --max-attempts 1 or clean the repo`)
@@ -115,11 +133,13 @@ async function runPhaseWithRetries(
   let lastError: unknown
 
   for (let attempt = 1; attempt <= prepared.maxAttempts; attempt++) {
+    progress.phaseRunning(phase.name, `attempt ${attempt}/${prepared.maxAttempts} ${formatModel(prepared.model)}`)
     log.info(`[${phase.name}] attempt ${attempt}/${prepared.maxAttempts} with ${formatModel(prepared.model)}`)
     try {
       return await runPhaseAttempt(client, workspace, phase, targetDir, prepared, attempt)
     } catch (error) {
       lastError = error
+      progress.phaseRunning(phase.name, `attempt ${attempt} failed`)
       log.warn(`[${phase.name}] attempt ${attempt} failed: ${formatSdkError(error)}`)
       if (!(error instanceof LoggedAttemptError)) {
         await writeAttemptLog(workspace, phase, attempt, { error: formatSdkError(error) })
@@ -287,6 +307,16 @@ export function shouldSkip(name: string, options: Pick<RunOptions, "onlyPhases" 
 
 function summaryReportNames(includeHumanReview: boolean) {
   return phases.flatMap((phase) => (phase.name === "implementer" && includeHumanReview ? [phase.name, "human-review"] : [phase.name]))
+}
+
+function progressPhases(options: RunOptions): ProgressPhase[] {
+  return phases.flatMap((phase) => {
+    const progressPhase: ProgressPhase = { name: phase.name, description: phase.description }
+    if (phase.name === "implementer" && options.humanReview) {
+      return [progressPhase, { name: "human-review", description: "Manual implementation checkpoint" }]
+    }
+    return [progressPhase]
+  })
 }
 
 class LoggedAttemptError extends Error {}
