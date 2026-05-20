@@ -78,14 +78,7 @@ function agentConfig(
     permission: {
       edit: "allow",
       question: "deny",
-      bash: {
-        "*": "allow",
-        "rm -rf /*": "deny",
-        "rm -rf ~*": "deny",
-        "git push *": "deny",
-        "git reset --hard *": "deny",
-        "gh *": "deny",
-      },
+      bash: bashPolicy(),
       external_directory: {
         "*": "deny",
         [join(runDir, "**")]: "allow",
@@ -93,6 +86,128 @@ function agentConfig(
     },
     prompt,
   }
+}
+
+function bashPolicy(): Record<string, "allow" | "deny" | "ask"> {
+  const allow = [
+    // flutter / dart toolchain
+    "flutter analyze*",
+    "flutter test*",
+    "flutter pub get",
+    "flutter pub upgrade",
+    "flutter pub outdated",
+    "flutter pub deps*",
+    "flutter format*",
+    "flutter clean",
+    "flutter doctor*",
+    "flutter --version",
+    "dart analyze*",
+    "dart test*",
+    "dart format*",
+    "dart pub get",
+    "dart pub upgrade",
+    "dart pub outdated",
+    "dart pub deps*",
+    "dart run build_runner*",
+    "dart --version",
+    // maestro (dry-run only is safe; runs hit a device which we already block by env)
+    "maestro test --dry-run*",
+    "maestro --version",
+    // read-only git
+    "git status*",
+    "git diff*",
+    "git log*",
+    "git show*",
+    "git rev-parse*",
+    "git branch*",
+    "git ls-files*",
+    "git ls-tree*",
+    "git config --get*",
+    "git stash list*",
+    "git remote -v",
+    "git --version",
+    // generic read-only shell
+    "pwd",
+    "ls*",
+    "cat*",
+    "head*",
+    "tail*",
+    "grep*",
+    "rg*",
+    "find*",
+    "wc*",
+    "echo*",
+    "printf*",
+    "which*",
+    "whoami",
+    "file*",
+    "tree*",
+    "stat*",
+    "true",
+    "false",
+  ]
+  const deny = [
+    // remote operations - always Archer's job
+    "git push*",
+    "git push",
+    "git fetch*",
+    "git pull*",
+    "git remote add*",
+    "git remote set-url*",
+    "git remote rm*",
+    "git remote remove*",
+    "gh*",
+    "gh ",
+    // history rewrite or destructive git
+    "git reset --hard*",
+    "git reset --keep*",
+    "git reset --merge*",
+    "git rebase*",
+    "git filter-branch*",
+    "git filter-repo*",
+    "git clean -f*",
+    "git clean -d*",
+    "git checkout .*",
+    "git restore .*",
+    "git worktree*",
+    // recursive removes against the filesystem root or home
+    "rm -rf /*",
+    "rm -rf /",
+    "rm -fr /*",
+    "rm -fr /",
+    "rm -rf ~*",
+    "rm -fr ~*",
+    "rm -rf $HOME*",
+    "rm -fr $HOME*",
+    "rm -rf ${HOME}*",
+    // download-and-execute patterns
+    "curl* | sh*",
+    "curl* | bash*",
+    "wget* | sh*",
+    "wget* | bash*",
+    "curl* |sh*",
+    "curl* |bash*",
+    // package install
+    "npm install*",
+    "npm i *",
+    "yarn add*",
+    "pnpm add*",
+    "brew install*",
+    "pip install*",
+    "pipx install*",
+    "cargo install*",
+    "go install*",
+    "gem install*",
+    // privilege escalation
+    "sudo*",
+    "su*",
+    "doas*",
+  ]
+  const policy: Record<string, "allow" | "deny" | "ask"> = {}
+  for (const pattern of deny) policy[pattern] = "deny"
+  for (const pattern of allow) policy[pattern] = "allow"
+  policy["*"] = "ask"
+  return policy
 }
 
 const implementerPrompt = [

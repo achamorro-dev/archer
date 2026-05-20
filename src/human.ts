@@ -128,7 +128,7 @@ async function startApp(options: RunOptions): Promise<AppProcess | undefined> {
   }
 
   log.info(`[human-review] starting app: ${options.appRunCommand}`)
-  const proc = Bun.spawn(["sh", "-lc", options.appRunCommand], {
+  const proc = Bun.spawn(["sh", "-c", options.appRunCommand], {
     cwd: options.targetDir,
     stdin: "ignore",
     stdout: "inherit",

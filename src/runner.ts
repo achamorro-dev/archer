@@ -9,6 +9,7 @@ import { addAllAndCommit, createCleanRepoSnapshot, ensureRepoReady, restoreRepoS
 import { runHumanReviewGate } from "./human"
 import { log } from "./log"
 import { startOpencode } from "./opencode"
+import { startPermissionGate, type PermissionGate } from "./permissions"
 import { phases } from "./phases"
 import { createProgressUI, noopProgress, type ProgressPhase, type ProgressUI } from "./progress"
 import type { Phase, RunOptions } from "./types"
@@ -24,6 +25,7 @@ export async function run(options: RunOptions) {
   let runErr: unknown
   let opencode: Awaited<ReturnType<typeof startOpencode>> | undefined
   let progress: ProgressUI = noopProgress
+  let permissions: PermissionGate | undefined
 
   try {
     progress = await createProgressUI(progressPhases(options), options.tui)
@@ -36,6 +38,12 @@ export async function run(options: RunOptions) {
     opencode = await startOpencode(opencodeConfig(workspace.dir))
     progress.message("opencode SDK ready")
     log.info(`opencode SDK ready at ${opencode.url}`)
+
+    permissions = startPermissionGate({
+      client: opencode.client,
+      progress,
+      interactive: Boolean(process.stdin.isTTY && process.stdout.isTTY),
+    })
 
     for (const phase of phases) {
       if (shouldSkip(phase.name, options)) {
@@ -54,6 +62,7 @@ export async function run(options: RunOptions) {
     runErr = error
     throw error
   } finally {
+    await permissions?.stop()
     progress.stop()
     opencode?.close()
 

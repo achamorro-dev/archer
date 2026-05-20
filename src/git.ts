@@ -94,6 +94,15 @@ export async function addAllAndCommit(message: string, cwd: string) {
     return false
   }
 
+  const suspicious = findSuspiciousStagedFiles(status.stdout)
+  if (suspicious.length > 0) {
+    await execFile("git", ["reset"], { cwd })
+    throw new Error(
+      `refusing to commit files that look like secrets: ${suspicious.join(", ")}. ` +
+        `Add them to .gitignore (or remove them) and re-run.`,
+    )
+  }
+
   await execFile("git", ["commit", "-m", message], {
     cwd,
     env: {
@@ -104,4 +113,37 @@ export async function addAllAndCommit(message: string, cwd: string) {
     },
   })
   return true
+}
+
+const secretPatterns: RegExp[] = [
+  /(^|\/)\.env(\..+)?$/i,
+  /(^|\/)\.envrc$/i,
+  /(^|\/)secrets?\.(json|yaml|yml|toml|ini|env|txt)$/i,
+  /(^|\/)credentials?(\..+)?$/i,
+  /(^|\/)id_(rsa|dsa|ecdsa|ed25519)(\.pub)?$/i,
+  /\.pem$/i,
+  /\.key$/i,
+  /\.p12$/i,
+  /\.pfx$/i,
+  /\.keystore$/i,
+  /\.jks$/i,
+  /\.mobileprovision$/i,
+  /\.gpg$/i,
+  /(^|\/)service[-_]account\.json$/i,
+  /(^|\/)gcloud[-_]key\.json$/i,
+  /(^|\/)aws[-_]credentials$/i,
+]
+
+export function findSuspiciousStagedFiles(porcelain: string): string[] {
+  const out: string[] = []
+  for (const raw of porcelain.split("\n")) {
+    if (!raw) continue
+    const code = raw.slice(0, 2)
+    if (!/[AMR?]/.test(code[0] ?? "") && !/[AM?]/.test(code[1] ?? "")) continue
+    const rest = raw.slice(3)
+    const path = rest.includes(" -> ") ? rest.split(" -> ").pop()! : rest
+    const clean = path.replace(/^"|"$/g, "")
+    if (secretPatterns.some((pattern) => pattern.test(clean))) out.push(clean)
+  }
+  return out
 }

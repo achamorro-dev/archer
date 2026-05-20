@@ -103,6 +103,26 @@ archer --prompt-file prd.md --include-dirty --max-attempts 1
 
 In interactive terminals, Archer shows an OpenTUI split-footer with live harness progress across phases. Use `--no-tui` to fall back to plain logs.
 
+## Permission gate
+
+Agents run with a restricted bash policy: a small allowlist of safe Flutter/Dart/git commands, a small denylist of unambiguously dangerous patterns (`git push*`, `gh*`, `sudo*`, recursive deletes against `/` or `~`, `curl … | sh`, package installers), and everything else falls through to `ask`.
+
+When an agent runs a command that isn't on the allowlist, Archer prints the request and prompts:
+
+```
+approve? [o]nce, [a]lways, [r]eject >
+```
+
+- `o` allows the single call.
+- `a` allows future calls matching the same pattern for the rest of the run.
+- `r` rejects the call (the agent receives a denial and decides what to do next).
+
+In non-interactive runs (no TTY), unknown commands are auto-rejected and logged. Tighten the policy further or expand the allowlist in `src/agents.ts` (`bashPolicy`).
+
+## Commit safety
+
+Before each commit Archer scans the staged files for common secret names (`.env*`, `*.pem`, `*.key`, `id_rsa*`, `credentials*`, `*.p12`, `*.keystore`, ...). If any match, the commit is aborted, the index reset, and Archer asks you to add them to `.gitignore` (or delete them) before re-running. Combined with `--include-dirty` this is the only line of defense against accidentally publishing a secret your working tree had lying around — review the resulting commits with `git show` before pushing.
+
 During `human-review`, Archer waits 10 seconds for an explicit action. If nobody answers, it automatically starts the preferred Flutter emulator, or the first emulator returned by `flutter emulators --machine`, then runs the app command in the target worktree so the implementation is compiled and ready to test when the user returns.
 
 ## Efficient Attachments
@@ -160,9 +180,10 @@ archer/
 │   ├── cli.ts           # flag parsing
 │   ├── runner.ts        # pipeline orchestration
 │   ├── opencode.ts      # startup/control via SDK
-│   ├── agents.ts        # inline prompts and agent config
+│   ├── agents.ts        # inline prompts, agent config, bash policy
+│   ├── permissions.ts   # live permission gate for tool calls that fall outside the allowlist
 │   ├── attachments.ts   # FilePartInput for --file and internal attachments
-│   ├── git.ts           # diff and commit
+│   ├── git.ts           # diff, commit, and pre-commit secret scan
 │   ├── workspace.ts     # run dir
 │   └── phases.ts        # declarative phase definition
 ├── test/                # unit tests for CLI/orchestration
