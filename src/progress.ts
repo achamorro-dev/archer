@@ -48,13 +48,26 @@ export type ProgressDiffSummary = {
   deletions: number
 }
 
+export type PermissionReply = "once" | "always" | "reject"
+
+export type PermissionPromptInfo = {
+  id: string
+  permission: string
+  patterns: string[]
+  command?: string
+  target?: string
+  description?: string
+  sessionID?: string
+}
+
 export type ProgressUI = {
   start(runID: string, targetDir: string): void
   serverReady(url: string): void
   phaseStarted(name: string, detail?: string): void
   phaseRunning(name: string, detail?: string): void
   phaseSession(name: string, sessionID: string): void
-  phaseActivity(name: string, detail: string, kind?: ActivityKind): void
+  /** `pulse` marks heartbeat noise (provider busy, streaming…) that updates the live status line but stays out of the activity feed. */
+  phaseActivity(name: string, detail: string, kind?: ActivityKind, pulse?: boolean): void
   phaseStepUsage(name: string, usage: ProgressStepUsage): void
   phaseUsageTotal(name: string, usage: ProgressUsage): void
   phaseTodos(name: string, todos: ProgressTodo[]): void
@@ -62,6 +75,8 @@ export type ProgressUI = {
   phaseCompleted(name: string, detail?: string): void
   phaseSkipped(name: string): void
   phaseFailed(name: string, detail?: string): void
+  /** When present, the UI resolves permission prompts itself (no terminal fallback). */
+  askPermission?(info: PermissionPromptInfo): Promise<PermissionReply>
   message(message: string): void
   suspend(): void
   resume(): void

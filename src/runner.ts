@@ -499,10 +499,13 @@ type ActivityState = {
   lastReasoningUpdate: number
   lastTextUpdate: number
   lastServerEvent: number
+  messageUsage: Map<string, { cost: number; tokens: ProgressTokens }>
+  usageSignature: string
 }
 
 type SessionSignal =
-  | { type: "activity"; kind: ActivityKind; message: string; stepUsage?: ProgressStepUsage }
+  | { type: "activity"; kind: ActivityKind; message: string; stepUsage?: ProgressStepUsage; pulse?: boolean }
+  | { type: "usage"; usage: ProgressUsage }
   | { type: "todos"; todos: ProgressTodo[]; message: string }
   | { type: "diff"; summary: ProgressDiffSummary }
   | { type: "idle" }
@@ -524,15 +527,7 @@ function watchSession(
   },
 ): SessionWatcher {
   const controller = new AbortController()
-  const state: ActivityState = {
-    reasoningChars: 0,
-    textChars: 0,
-    textTail: "",
-    currentStepModel: "",
-    lastReasoningUpdate: 0,
-    lastTextUpdate: 0,
-    lastServerEvent: Date.now(),
-  }
+  const state = newActivityState()
 
   let settled = false
   let sawWork = false
@@ -599,7 +594,10 @@ function watchSession(
     switch (signal.type) {
       case "activity":
         if (signal.stepUsage) input.progress.phaseStepUsage(input.phaseName, signal.stepUsage)
-        input.progress.phaseActivity(input.phaseName, signal.message, signal.kind)
+        input.progress.phaseActivity(input.phaseName, signal.message, signal.kind, signal.pulse)
+        return
+      case "usage":
+        input.progress.phaseUsageTotal(input.phaseName, signal.usage)
         return
       case "todos":
         input.progress.phaseTodos(input.phaseName, signal.todos)
@@ -756,11 +754,30 @@ function payloadMatchesSession(payload: unknown, sessionID: string) {
   return properties?.sessionID === sessionID
 }
 
+export function newActivityState(): ActivityState {
+  return {
+    reasoningChars: 0,
+    textChars: 0,
+    textTail: "",
+    currentStepModel: "",
+    lastReasoningUpdate: 0,
+    lastTextUpdate: 0,
+    lastServerEvent: Date.now(),
+    messageUsage: new Map(),
+    usageSignature: "",
+  }
+}
+
 function activity(kind: ActivityKind, message: string, stepUsage?: ProgressStepUsage): SessionSignal {
   return { type: "activity", kind, message, stepUsage }
 }
 
-function describeSessionActivity(payload: unknown, state: ActivityState): SessionSignal | undefined {
+// Heartbeats refresh the live status line but never land in the activity feed.
+function pulse(kind: ActivityKind, message: string): SessionSignal {
+  return { type: "activity", kind, message, pulse: true }
+}
+
+export function describeSessionActivity(payload: unknown, state: ActivityState): SessionSignal | undefined {
   const type = payloadType(payload)
   const properties = payloadProperties(payload)
   if (!properties) return undefined
@@ -808,8 +825,10 @@ function describeSessionActivity(payload: unknown, state: ActivityState): Sessio
     }
     case "session.next.text.ended":
       return activity("write", `response complete (${formatCharCount(pickString(properties, ["text"]).length || state.textChars)})`)
+    case "message.updated":
+      return messageUsageSignal(properties, state)
     case "message.part.delta":
-      return activity("write", `streaming ${pickString(properties, ["field"]) || "message"}`)
+      return pulse("write", `streaming ${pickString(properties, ["field"]) || "message"}`)
     case "session.next.tool.input.started":
       return activity("tool", `preparing ${pickString(properties, ["name"]) || "tool"}`)
     case "session.next.tool.called":
@@ -854,8 +873,8 @@ function describeSessionActivity(payload: unknown, state: ActivityState): Sessio
 function describeSessionStatus(value: unknown): SessionSignal | undefined {
   if (!value || typeof value !== "object") return undefined
   const status = value as { type?: unknown; attempt?: unknown; message?: unknown }
-  if (status.type === "busy") return activity("info", "provider busy")
-  if (status.type === "idle") return activity("info", "provider idle")
+  if (status.type === "busy") return pulse("info", "provider busy")
+  if (status.type === "idle") return pulse("info", "provider idle")
   if (status.type === "retry") {
     return activity("retry", `provider retry ${status.attempt ?? ""}: ${typeof status.message === "string" ? status.message : "waiting"}`)
   }
@@ -916,6 +935,44 @@ function stepUsageFromEvent(payload: unknown, properties: Record<string, unknown
     sessionID: typeof properties.sessionID === "string" ? properties.sessionID : undefined,
     model: model || usage.model,
   }
+}
+
+// Assistant messages carry cumulative cost/tokens that opencode refreshes on
+// every model round-trip, so message.updated is the live usage signal; step
+// deltas only matter as fallback until the first one arrives.
+function messageUsageSignal(properties: Record<string, unknown>, state: ActivityState): SessionSignal | undefined {
+  const info = properties.info
+  if (!info || typeof info !== "object") return undefined
+  const message = info as Partial<AssistantMessage> & { role?: unknown }
+  if (message.role !== "assistant" || typeof message.id !== "string") return undefined
+
+  const tokens = tokensFromValue(message.tokens)
+  const cost = typeof message.cost === "number" && Number.isFinite(message.cost) ? message.cost : 0
+  // All-zero updates (message creation) must not claim the authoritative total,
+  // or step-delta accounting would be suppressed with nothing to replace it.
+  if (!tokens || (tokens.total === 0 && cost === 0)) return undefined
+  state.messageUsage.set(message.id, { cost, tokens })
+
+  let totalCost = 0
+  const total: ProgressTokens = { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, total: 0 }
+  for (const usage of state.messageUsage.values()) {
+    totalCost += usage.cost
+    total.input += usage.tokens.input
+    total.output += usage.tokens.output
+    total.reasoning += usage.tokens.reasoning
+    total.cacheRead += usage.tokens.cacheRead
+    total.cacheWrite += usage.tokens.cacheWrite
+    total.total += usage.tokens.total
+  }
+
+  const signature = `${totalCost.toFixed(6)}:${total.input}:${total.output}:${total.reasoning}:${total.total}`
+  if (signature === state.usageSignature) return undefined
+  state.usageSignature = signature
+
+  const variant = typeof message.variant === "string" && message.variant ? `#${message.variant}` : ""
+  const model = message.providerID && message.modelID ? `${message.providerID}/${message.modelID}${variant}` : undefined
+  const sessionID = typeof properties.sessionID === "string" ? properties.sessionID : undefined
+  return { type: "usage", usage: { cost: totalCost, tokens: total, sessionID, model } }
 }
 
 function combinedAssistantUsage(infos: AssistantMessage[], sessionID: string): ProgressUsage | undefined {

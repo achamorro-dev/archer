@@ -2,6 +2,7 @@ import {
   BoxRenderable,
   StyledText,
   TextRenderable,
+  bg,
   bold,
   createCliRenderer,
   fg,
@@ -15,6 +16,8 @@ import { openOpencodeSessionWindow } from "./opencode"
 import type { BoxOptions, CliRenderer, KeyEvent, TextChunk } from "@opentui/core"
 import type {
   ActivityKind,
+  PermissionPromptInfo,
+  PermissionReply,
   ProgressDiffSummary,
   ProgressPhase,
   ProgressStepUsage,
@@ -59,8 +62,14 @@ const kindStyle: Record<ActivityKind, { icon: string; color: string }> = {
 }
 
 const spinnerFrames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
-const pipelineWidth = 30
+const pipelineWidth = 32
 const feedLimit = 100
+
+const permissionChoices: ReadonlyArray<{ reply: PermissionReply; label: string; color: string }> = [
+  { reply: "once", label: "allow once", color: theme.green },
+  { reply: "always", label: "always allow", color: theme.accent },
+  { reply: "reject", label: "reject", color: theme.red },
+]
 
 type PhaseStatus = "pending" | "running" | "completed" | "skipped" | "failed"
 
@@ -99,6 +108,11 @@ type FeedEntry = {
   message: string
 }
 
+type PendingPermission = {
+  info: PermissionPromptInfo
+  resolve: (reply: PermissionReply) => void
+}
+
 export async function createTuiProgress(phases: readonly ProgressPhase[], onAbort?: () => void): Promise<ProgressUI> {
   const renderer = await createCliRenderer({
     screenMode: "alternate-screen",
@@ -126,6 +140,11 @@ export class TuiProgress implements ProgressUI {
   private readonly sessionText: TextRenderable
   private readonly feedText: TextRenderable
   private readonly footerText: TextRenderable
+  private readonly overlay: BoxRenderable
+  private readonly modal: BoxRenderable
+  private readonly modalText: TextRenderable
+  private readonly permissionQueue: PendingPermission[] = []
+  private permissionChoice = 0
   private readonly handleKeyPress = (key: KeyEvent) => {
     if ((key.ctrl && key.name === "c") || key.raw === "\u0003") {
       key.preventDefault()
@@ -133,6 +152,10 @@ export class TuiProgress implements ProgressUI {
       this.addEvent("archer", "system", "ctrl+c received; shutting down")
       this.render()
       this.onAbort?.()
+      return
+    }
+    if (this.permissionQueue.length > 0) {
+      this.handlePermissionKey(key)
       return
     }
     if (key.name !== "o" || key.ctrl || key.meta || key.option) return
@@ -175,8 +198,8 @@ export class TuiProgress implements ProgressUI {
 
     const header = this.panel({
       id: "archer-header",
-      height: 5,
-      borderColor: theme.accent,
+      height: 4,
+      borderColor: theme.border,
       backgroundColor: theme.panel,
     })
 
@@ -212,7 +235,7 @@ export class TuiProgress implements ProgressUI {
       width: "100%",
       borderColor: theme.border,
       backgroundColor: theme.panel,
-      title: " session ",
+      title: " current phase ",
       titleAlignment: "left",
     })
 
@@ -255,6 +278,37 @@ export class TuiProgress implements ProgressUI {
     shell.add(body)
     shell.add(footer.box)
     renderer.root.add(shell)
+
+    this.overlay = new BoxRenderable(renderer, {
+      id: "archer-permission-overlay",
+      position: "absolute",
+      left: 0,
+      top: 0,
+      width: "100%",
+      height: "100%",
+      zIndex: 100,
+      alignItems: "center",
+      justifyContent: "center",
+      visible: false,
+    })
+    this.modal = new BoxRenderable(renderer, {
+      id: "archer-permission-modal",
+      border: true,
+      borderStyle: "rounded",
+      borderColor: theme.yellow,
+      backgroundColor: theme.panel,
+      title: " ⚿ permission required ",
+      titleAlignment: "left",
+      width: 64,
+      height: 10,
+      paddingX: 2,
+      paddingY: 1,
+    })
+    this.modalText = new TextRenderable(renderer, { content: "", fg: theme.text, width: "100%", height: "100%" })
+    this.modal.add(this.modalText)
+    this.overlay.add(this.modal)
+    renderer.root.add(this.overlay)
+
     renderer.keyInput.on("keypress", this.handleKeyPress)
 
     this.ticker = setInterval(() => this.render(), 250)
@@ -296,14 +350,15 @@ export class TuiProgress implements ProgressUI {
     this.render()
   }
 
-  phaseActivity(name: string, detail: string, kind: ActivityKind = "info") {
+  phaseActivity(name: string, detail: string, kind: ActivityKind = "info", pulse = false) {
     const phase = this.findPhase(name)
     if (!phase) return
     phase.now = { kind, message: detail }
     phase.updatedAt = Date.now()
     this.activePhase = name
     this.status = `${name}: ${detail}`
-    this.addEvent(name, kind, detail)
+    if (pulse) this.lastActivityAt = Date.now()
+    else this.addEvent(name, kind, detail)
     this.render()
   }
 
@@ -374,6 +429,16 @@ export class TuiProgress implements ProgressUI {
     this.addEvent(name, "error", detail || "failed")
   }
 
+  askPermission(info: PermissionPromptInfo): Promise<PermissionReply> {
+    if (this.renderer.isDestroyed) return Promise.resolve("reject")
+    return new Promise((resolve) => {
+      this.permissionQueue.push({ info, resolve })
+      if (this.permissionQueue.length === 1) this.permissionChoice = 0
+      this.addEvent("archer", "permission", `approval needed: ${permissionSummary(info)}`)
+      this.render()
+    })
+  }
+
   message(message: string) {
     this.status = message
     this.addEvent("archer", "system", message)
@@ -397,6 +462,7 @@ export class TuiProgress implements ProgressUI {
     clearInterval(this.ticker)
     log.mute(false)
     this.renderer.keyInput.off("keypress", this.handleKeyPress)
+    for (const pending of this.permissionQueue.splice(0)) pending.resolve("reject")
     if (this.renderer.isDestroyed) return
     this.renderer.destroy()
   }
@@ -417,6 +483,47 @@ export class TuiProgress implements ProgressUI {
     })
     box.add(text)
     return { box, text }
+  }
+
+  private handlePermissionKey(key: KeyEvent) {
+    key.preventDefault()
+    key.stopPropagation()
+    switch (key.name) {
+      case "left":
+        this.permissionChoice = (this.permissionChoice + permissionChoices.length - 1) % permissionChoices.length
+        break
+      case "right":
+      case "tab":
+        this.permissionChoice = (this.permissionChoice + 1) % permissionChoices.length
+        break
+      case "return":
+      case "linefeed":
+        this.resolvePermission(permissionChoices[this.permissionChoice]!.reply)
+        break
+      case "o":
+      case "y":
+        this.resolvePermission("once")
+        break
+      case "a":
+        this.resolvePermission("always")
+        break
+      case "r":
+      case "n":
+      case "escape":
+        this.resolvePermission("reject")
+        break
+    }
+    this.render()
+  }
+
+  private resolvePermission(reply: PermissionReply) {
+    const pending = this.permissionQueue.shift()
+    if (!pending) return
+    this.permissionChoice = 0
+    const verdict = reply === "once" ? "allowed once" : reply === "always" ? "always allowed" : "rejected"
+    this.addEvent("archer", "permission", `${verdict}: ${permissionSummary(pending.info)}`)
+    pending.resolve(reply)
+    this.render()
   }
 
   private openActiveSessionWindow(source: "click" | "key") {
@@ -506,40 +613,88 @@ export class TuiProgress implements ProgressUI {
     if (this.renderer.isDestroyed) return
     const now = Date.now()
     const active = this.findPhase(this.activePhase) ?? this.phases.find((phase) => phase.status === "running")
+    const innerWidth = Math.max(40, this.renderer.width - 6)
     const rightWidth = Math.max(40, this.renderer.width - pipelineWidth - 9)
 
-    this.headerText.content = this.headerContent(now, rightWidth + pipelineWidth)
+    this.headerText.content = this.headerContent(now, innerWidth)
     this.pipelineText.content = this.pipelineContent(now)
     this.sessionText.content = this.sessionContent(active, now, rightWidth)
     this.feedText.content = this.feedContent(now, rightWidth)
-    this.footerText.content = t`${fg(theme.dim)("[")}${fg(theme.accent)("o")}${fg(theme.dim)("] open session in Terminal · click here · ")}${fg(theme.yellow)("ctrl+c")}${fg(theme.dim)(" abort · --no-tui plain logs")}`
+    this.footerText.content = this.footerContent(now, innerWidth)
+    this.renderPermissionModal()
     this.renderer.requestRender()
   }
 
   private headerContent(now: number, width: number) {
-    const done = this.phases.filter((phase) => phase.status === "completed" || phase.status === "skipped").length
-    const total = this.phases.length
     const usage = totalUsage(this.phases)
-    const quiet = now - this.lastActivityAt
+    const done = this.phases.filter((phase) => phase.status === "completed" || phase.status === "skipped").length
+    const failed = this.phases.some((phase) => phase.status === "failed")
+    const finished = this.phases.length > 0 && done === this.phases.length
 
-    const left = t`${bold(fg(theme.accent)("◤ ARCHER"))} ${fg(theme.dim)(`run ${this.runID || "…"}`)}  ${fg(theme.faint)(shortPath(this.targetDir))}`
-    const right = t`${progressChunks(done, total, 14)}  ${fg(theme.text)(formatElapsed(now - this.startedAt))} ${fg(theme.dim)("elapsed")}  ${fg(theme.green)(formatMoney(usage.cost))}  ${fg(theme.dim)(`↑${formatCount(usage.tokens.input)} ↓${formatCount(usage.tokens.output)}`)}`
-    const statusLine = t`${fg(theme.dim)(this.serverUrl ? `⚡ ${this.serverUrl}` : "⚡ starting opencode…")}  ${fg(quiet > 60_000 ? theme.yellow : theme.faint)(`last event ${formatAgo(quiet)}`)}  ${fg(theme.faint)(truncate(this.status, Math.max(20, width - 60)))}`
-    return joinLines([left, right, statusLine])
+    const title: TextChunk[] = [
+      bold(fg(theme.accent)("◆ archer")),
+      fg(theme.faint)("  ·  "),
+      fg(theme.text)(truncate(projectName(this.targetDir), 28)),
+    ]
+    const line1 = padBetween(title, this.stateChunks(now), width)
+
+    const barWidth = Math.max(16, Math.min(48, Math.floor(width * 0.42)))
+    const barColor = failed ? theme.red : finished ? theme.green : theme.accent
+    const line2 = new StyledText([
+      ...progressBar(this.overallFraction(), barWidth, barColor),
+      raw("  "),
+      fg(theme.text)(`${done}/${this.phases.length}`),
+      fg(theme.dim)(" phases"),
+      fg(theme.faint)("  ·  "),
+      fg(theme.text)(formatElapsed(now - this.startedAt)),
+      fg(theme.faint)("  ·  "),
+      fg(theme.green)(formatMoney(usage.cost)),
+      fg(theme.faint)("  ·  "),
+      fg(theme.dim)(`↑${formatCount(usage.tokens.input)} ↓${formatCount(usage.tokens.output)}`),
+    ])
+    return joinLines([line1, line2])
+  }
+
+  private stateChunks(now: number): TextChunk[] {
+    if (this.permissionQueue.length > 0) return [bold(fg(theme.yellow)("⚿ waiting for your approval"))]
+    const failed = this.phases.find((phase) => phase.status === "failed")
+    if (failed) return [bold(fg(theme.red)(`✗ ${failed.name} failed`))]
+    const running = this.phases.find((phase) => phase.status === "running")
+    if (running) return [fg(theme.accent)(`${spinnerFrame(now)} `), bold(fg(theme.text)(running.name)), fg(theme.dim)(" running")]
+    if (this.phases.length > 0 && this.phases.every((phase) => phase.status === "completed" || phase.status === "skipped")) {
+      return [bold(fg(theme.green)("✓ run complete"))]
+    }
+    return [fg(theme.dim)(truncate(this.status, 36))]
+  }
+
+  private overallFraction() {
+    const total = Math.max(1, this.phases.length)
+    let done = 0
+    for (const phase of this.phases) {
+      if (phase.status === "completed" || phase.status === "skipped") done += 1
+      else if (phase.status === "running") done += runningFraction(phase)
+    }
+    return Math.min(1, done / total)
   }
 
   private pipelineContent(now: number) {
-    const done = this.phases.filter((phase) => phase.status === "completed" || phase.status === "skipped").length
-    const out: StyledText[] = [t`${progressChunks(done, this.phases.length, pipelineWidth - 10)} ${fg(theme.dim)(`${done}/${this.phases.length}`)}`, plain("")]
-
+    const width = pipelineWidth - 4
+    const out: StyledText[] = []
     for (const phase of this.phases) {
-      const isActive = phase.name === this.activePhase && phase.status === "running"
-      const icon = statusIcon(phase.status, now)
-      const name = isActive ? bold(fg(theme.text)(phase.name)) : fg(phase.status === "pending" ? theme.dim : theme.text)(phase.name)
-      const meta = phaseMeta(phase, now)
-      out.push(new StyledText([icon, raw(" "), name, ...(meta ? [raw(" "), meta] : [])]))
+      const isActive = phase.status === "running"
+      const marker = isActive ? fg(theme.accent)("▎") : fg(theme.faint)(" ")
+      const name =
+        phase.status === "pending"
+          ? fg(theme.dim)(phase.name)
+          : phase.status === "skipped"
+            ? fg(theme.faint)(phase.name)
+            : isActive
+              ? bold(fg(theme.text)(phase.name))
+              : fg(theme.text)(phase.name)
+      const left: TextChunk[] = [marker, raw(" "), statusIcon(phase.status, now), raw(" "), name]
+      out.push(padBetween(left, phaseMetaChunks(phase, now), width))
       if (isActive && phase.detail) {
-        out.push(t`  ${fg(theme.faint)(truncate(phase.detail, pipelineWidth - 6))}`)
+        out.push(t`    ${fg(theme.faint)(truncate(phase.detail, width - 5))}`)
       }
     }
     return joinLines(out)
@@ -551,9 +706,14 @@ export class TuiProgress implements ProgressUI {
     }
 
     const out: StyledText[] = []
-    const spin = active.status === "running" ? fg(theme.accent)(`${spinnerFrame(now)} `) : statusIconPair(active.status, now)
-    out.push(new StyledText([spin, bold(fg(theme.accent)(active.name)), raw("  "), fg(theme.dim)(active.detail ? truncate(active.detail, width - active.name.length - 4) : active.status)]))
-    out.push(t`${fg(theme.faint)(active.sessionID ? shortID(active.sessionID) : "creating session…")} ${fg(theme.dim)(active.lastStepModel || "")}`)
+    const head: TextChunk[] =
+      active.status === "running"
+        ? [fg(theme.accent)(`${spinnerFrame(now)} `), bold(fg(theme.text)(active.name))]
+        : [statusIcon(active.status, now), raw(" "), bold(fg(theme.text)(active.name))]
+    if (active.detail) {
+      head.push(fg(theme.faint)("  ·  "), fg(theme.dim)(truncate(active.detail, Math.max(10, width - active.name.length - 8))))
+    }
+    out.push(new StyledText(head))
     out.push(plain(""))
 
     const style = kindStyle[active.now.kind]
@@ -564,48 +724,128 @@ export class TuiProgress implements ProgressUI {
     )
     out.push(plain(""))
 
-    const quiet = now - active.updatedAt
-    const stats: TextChunk[] = [
-      fg(theme.dim)("steps "),
-      fg(theme.text)(String(active.stepCount)),
-      fg(theme.dim)("  cost "),
-      fg(theme.green)(active.usageReported ? formatMoney(active.cost) : "—"),
-      fg(theme.dim)("  tokens "),
-      fg(theme.text)(active.usageReported ? `↑${formatCount(active.tokens.input)} ↓${formatCount(active.tokens.output)}` : "—"),
-    ]
-    if (quiet > 10_000 && active.status === "running") {
-      stats.push(fg(quiet > 60_000 ? theme.yellow : theme.faint)(`  quiet ${Math.floor(quiet / 1000)}s`))
-    }
-    out.push(new StyledText(stats))
-
     if (active.todos.length > 0) out.push(todoLine(active.todos, width))
     if (active.diff && active.diff.files > 0) {
       out.push(
-        t`${fg(theme.dim)("files ")}${fg(theme.text)(String(active.diff.files))} ${fg(theme.green)(`+${active.diff.additions}`)} ${fg(theme.red)(`−${active.diff.deletions}`)}`,
+        t`${fg(theme.dim)("changes ")}${fg(theme.text)(`${active.diff.files} files`)} ${fg(theme.green)(`+${active.diff.additions}`)} ${fg(theme.red)(`−${active.diff.deletions}`)}`,
       )
     }
+
+    const quiet = now - active.updatedAt
+    const stats: TextChunk[] = [
+      fg(theme.faint)("steps "),
+      fg(theme.dim)(String(active.stepCount)),
+      fg(theme.faint)(" · cost "),
+      fg(theme.dim)(active.usageReported ? formatMoney(active.cost) : "—"),
+      fg(theme.faint)(" · tokens "),
+      fg(theme.dim)(active.usageReported ? `↑${formatCount(active.tokens.input)} ↓${formatCount(active.tokens.output)}` : "—"),
+    ]
+    if (active.lastStepModel) stats.push(fg(theme.faint)(` · ${truncate(active.lastStepModel, 28)}`))
+    if (active.sessionID) stats.push(fg(theme.faint)(` · ${shortID(active.sessionID)}`))
+    if (quiet > 10_000 && active.status === "running") {
+      stats.push(fg(quiet > 60_000 ? theme.yellow : theme.faint)(` · quiet ${Math.floor(quiet / 1000)}s`))
+    }
+    out.push(new StyledText(stats))
     return joinLines(out)
   }
 
   private feedContent(now: number, width: number) {
-    const visible = Math.max(4, this.renderer.height - 22)
+    const visible = Math.max(4, this.renderer.height - 21)
     const events = this.feed.slice(-visible).reverse()
     if (events.length === 0) return t`${fg(theme.dim)("no activity yet…")}`
 
     return joinLines(
-      events.map((entry) => {
+      events.map((entry, index) => {
         const style = kindStyle[entry.kind]
+        // Newest-first list: blank the phase label when the older neighbour
+        // repeats it, so each phase shows once at the start of its group.
+        const older = events[index + 1]
+        const phaseLabel = older && older.phase === entry.phase ? raw(" ".repeat(12)) : fg(theme.dim)(entry.phase.padEnd(12).slice(0, 12))
         return new StyledText([
           fg(theme.faint)(formatTime(entry.time)),
           raw(" "),
           fg(style.color)(style.icon),
           raw(" "),
-          fg(theme.dim)(entry.phase.padEnd(12).slice(0, 12)),
+          phaseLabel,
           raw(" "),
           fg(entry.kind === "error" ? theme.red : theme.text)(truncate(entry.message, Math.max(20, width - 26))),
         ])
       }),
     )
+  }
+
+  private footerContent(now: number, width: number) {
+    if (this.permissionQueue.length > 0) {
+      const left: TextChunk[] = [
+        fg(theme.yellow)("⚿ "),
+        fg(theme.dim)("←/→ choose · "),
+        fg(theme.accent)("enter"),
+        fg(theme.dim)(" confirm · "),
+        fg(theme.accent)("o"),
+        fg(theme.dim)("nce · "),
+        fg(theme.accent)("a"),
+        fg(theme.dim)("lways · "),
+        fg(theme.accent)("r"),
+        fg(theme.dim)("eject · "),
+        fg(theme.accent)("esc"),
+        fg(theme.dim)(" rejects"),
+      ]
+      const right: TextChunk[] = this.permissionQueue.length > 1 ? [fg(theme.yellow)(`${this.permissionQueue.length} pending`)] : []
+      return padBetween(left, right, width)
+    }
+
+    const left: TextChunk[] = [
+      fg(theme.dim)("["),
+      fg(theme.accent)("o"),
+      fg(theme.dim)("] open session · "),
+      fg(theme.yellow)("ctrl+c"),
+      fg(theme.dim)(" abort"),
+    ]
+    const quiet = now - this.lastActivityAt
+    const right: TextChunk[] = [
+      fg(theme.faint)(this.runID ? `run ${this.runID}` : "run …"),
+      fg(theme.faint)(" · "),
+      fg(theme.faint)(this.serverUrl ? `⚡ ${shortUrl(this.serverUrl)}` : "⚡ starting…"),
+      fg(theme.faint)(" · "),
+      fg(quiet > 60_000 ? theme.yellow : theme.faint)(formatAgo(quiet)),
+    ]
+    return padBetween(left, right, width)
+  }
+
+  private renderPermissionModal() {
+    const pending = this.permissionQueue[0]
+    this.overlay.visible = Boolean(pending)
+    if (!pending) return
+
+    const boxWidth = Math.max(44, Math.min(68, this.renderer.width - 8))
+    const width = boxWidth - 6
+    const info = pending.info
+    const lines: StyledText[] = []
+
+    const headChunks: TextChunk[] = [bold(fg(theme.text)(info.permission))]
+    if (this.permissionQueue.length > 1) headChunks.push(fg(theme.faint)(`  ·  ${this.permissionQueue.length - 1} more queued`))
+    lines.push(new StyledText(headChunks))
+    lines.push(plain(""))
+    if (info.command) lines.push(new StyledText([fg(theme.green)("$ "), fg(theme.text)(truncate(info.command, width - 2))]))
+    if (info.target) lines.push(new StyledText([fg(theme.dim)("target "), fg(theme.text)(truncate(info.target, width - 7))]))
+    if (info.patterns.length > 0) {
+      lines.push(new StyledText([fg(theme.dim)("pattern "), fg(theme.text)(truncate(info.patterns.join(", "), width - 8))]))
+    }
+    if (info.description) lines.push(t`${fg(theme.faint)(truncate(info.description, width))}`)
+    if (info.sessionID) lines.push(t`${fg(theme.faint)(`session ${shortID(info.sessionID)}`)}`)
+    lines.push(plain(""))
+
+    const buttons: TextChunk[] = []
+    permissionChoices.forEach((choice, index) => {
+      if (index > 0) buttons.push(raw("   "))
+      const label = ` ${choice.label} `
+      buttons.push(index === this.permissionChoice ? bold(bg(choice.color)(fg(theme.bg)(label))) : fg(theme.dim)(label))
+    })
+    lines.push(new StyledText(buttons))
+
+    this.modal.width = boxWidth
+    this.modal.height = lines.length + 4
+    this.modalText.content = joinLines(lines)
   }
 }
 
@@ -626,9 +866,14 @@ function raw(text: string): TextChunk {
   return stringToStyledText(text).chunks[0] ?? fg(theme.text)(text)
 }
 
-function statusIconPair(status: PhaseStatus, now: number): TextChunk {
-  const icon = statusIcon(status, now)
-  return { ...icon, text: `${icon.text} ` }
+function padBetween(left: TextChunk[], right: TextChunk[], width: number): StyledText {
+  const gap = Math.max(1, width - chunksLength(left) - chunksLength(right))
+  if (right.length === 0) return new StyledText(left)
+  return new StyledText([...left, raw(" ".repeat(gap)), ...right])
+}
+
+function chunksLength(chunks: TextChunk[]) {
+  return chunks.reduce((sum, chunk) => sum + chunk.text.length, 0)
 }
 
 function statusIcon(status: PhaseStatus, now: number): TextChunk {
@@ -640,45 +885,60 @@ function statusIcon(status: PhaseStatus, now: number): TextChunk {
     case "failed":
       return fg(theme.red)("✗")
     case "skipped":
-      return fg(theme.faint)("◌")
+      return fg(theme.faint)("⊘")
     default:
       return fg(theme.faint)("○")
   }
 }
 
-function phaseMeta(phase: PhaseState, now: number): TextChunk | undefined {
-  if (phase.status === "pending") return undefined
-  if (phase.status === "skipped") return fg(theme.faint)("skipped")
-  const parts: string[] = []
-  const started = phase.startedAt
-  if (started !== undefined) parts.push(formatElapsed((phase.endedAt ?? now) - started))
-  if (phase.usageReported) parts.push(formatMoney(phase.cost))
-  if (parts.length === 0) return undefined
-  return fg(phase.status === "failed" ? theme.red : theme.dim)(parts.join(" "))
+function phaseMetaChunks(phase: PhaseState, now: number): TextChunk[] {
+  if (phase.status === "pending") return []
+  if (phase.status === "skipped") return [fg(theme.faint)("skipped")]
+  const parts: TextChunk[] = []
+  if (phase.startedAt !== undefined) {
+    parts.push(fg(phase.status === "failed" ? theme.red : theme.dim)(formatElapsed((phase.endedAt ?? now) - phase.startedAt)))
+  }
+  if (phase.usageReported) parts.push(fg(theme.faint)(` ${formatMoney(phase.cost)}`))
+  return parts
 }
 
 function todoLine(todos: ProgressTodo[], width: number): StyledText {
   const completed = todos.filter((todo) => todo.status === "completed").length
-  const active = todos.filter((todo) => todo.status === "in_progress")
-  const inProgress = active[0]
-  const pending = todos.filter((todo) => todo.status === "pending").length
+  const inProgress = todos.find((todo) => todo.status === "in_progress")
   const chunks: TextChunk[] = [
-    fg(theme.dim)("todos "),
-    fg(theme.green)(`✓${completed}`),
-    fg(theme.accent)(` ▸${active.length}`),
-    fg(theme.faint)(` ○${pending}`),
+    fg(theme.faint)("todos "),
+    ...progressBar(todos.length === 0 ? 0 : completed / todos.length, 10, theme.teal),
+    fg(theme.text)(` ${completed}/${todos.length}`),
   ]
   if (inProgress) {
-    chunks.push(fg(theme.dim)(" → "))
-    chunks.push(fg(theme.text)(truncate(inProgress.content, Math.max(10, width - 24))))
+    chunks.push(fg(theme.faint)(" · "), fg(theme.dim)(truncate(inProgress.content, Math.max(10, width - 28))))
   }
   return new StyledText(chunks)
 }
 
-function progressChunks(done: number, total: number, width: number): TextChunk {
-  const safeTotal = Math.max(1, total)
-  const filled = Math.round((done / safeTotal) * width)
-  return fg(theme.accent)(`${"▰".repeat(filled)}${"▱".repeat(Math.max(0, width - filled))}`)
+// Box-drawing strokes render single-width everywhere, unlike the geometric
+// shapes (▰▱) that draw unevenly in many terminal fonts.
+function progressBar(fraction: number, width: number, color: string): TextChunk[] {
+  const cells = Math.max(0, Math.min(1, fraction)) * width
+  const filled = Math.floor(cells)
+  const head = filled < width && cells - filled >= 0.5
+  const track = width - filled - (head ? 1 : 0)
+  const chunks: TextChunk[] = []
+  if (filled > 0) chunks.push(fg(color)("━".repeat(filled)))
+  if (head) chunks.push(fg(color)("╸"))
+  if (track > 0) chunks.push(fg(theme.faint)("─".repeat(track)))
+  return chunks
+}
+
+function runningFraction(phase: PhaseState) {
+  if (phase.todos.length === 0) return 0.1
+  const completed = phase.todos.filter((todo) => todo.status === "completed").length
+  return Math.min(0.95, Math.max(0.1, completed / phase.todos.length))
+}
+
+function permissionSummary(info: PermissionPromptInfo) {
+  const detail = info.command || info.target || info.patterns.join(", ")
+  return detail ? `${info.permission} · ${truncate(detail, 120)}` : info.permission
 }
 
 function spinnerFrame(now: number) {
@@ -755,10 +1015,14 @@ function shortID(value: string) {
   return `${value.slice(0, 7)}…${value.slice(-4)}`
 }
 
-function shortPath(value: string) {
-  const home = process.env.HOME
-  if (home && value.startsWith(home)) return `~${value.slice(home.length)}`
-  return value
+function shortUrl(value: string) {
+  return value.replace(/^https?:\/\//, "")
+}
+
+function projectName(dir: string) {
+  if (!dir) return "…"
+  const parts = dir.split("/").filter(Boolean)
+  return parts[parts.length - 1] ?? dir
 }
 
 function truncate(value: string, max: number) {

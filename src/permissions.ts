@@ -4,7 +4,7 @@ import { createInterface } from "node:readline/promises"
 import type { OpencodeClient } from "@opencode-ai/sdk/v2"
 
 import { log } from "./log"
-import { noopProgress, type ProgressUI } from "./progress"
+import { noopProgress, type PermissionPromptInfo, type PermissionReply, type ProgressUI } from "./progress"
 
 type PermissionRequest = {
   id: string
@@ -16,7 +16,7 @@ type PermissionRequest = {
   tool?: { messageID: string; callID: string }
 }
 
-type Reply = "once" | "always" | "reject"
+type Reply = PermissionReply
 
 export type PermissionGate = {
   stop(): Promise<void>
@@ -91,6 +91,16 @@ async function handleRequest(client: OpencodeClient, request: PermissionRequest,
     return
   }
 
+  // The TUI resolves the prompt in-place; suspending to readline is only the
+  // plain-logs fallback so the run never drops to a bare black screen.
+  const ask = progress.askPermission?.bind(progress)
+  if (ask) {
+    const answer = await ask(promptInfo(request))
+    log.info(`[permission] replied ${answer} for ${request.permission}`)
+    await reply(client, request.id, answer, answer === "reject" ? "rejected by user" : undefined)
+    return
+  }
+
   progress.suspend()
   try {
     log.section("permission request")
@@ -100,6 +110,18 @@ async function handleRequest(client: OpencodeClient, request: PermissionRequest,
     await reply(client, request.id, answer, answer === "reject" ? "rejected by user" : undefined)
   } finally {
     progress.resume()
+  }
+}
+
+function promptInfo(request: PermissionRequest): PermissionPromptInfo {
+  return {
+    id: request.id,
+    permission: request.permission,
+    patterns: request.patterns.slice(0, 5),
+    command: pickString(request.metadata, ["command", "cmd"]) || undefined,
+    target: pickString(request.metadata, ["path", "file", "url"]) || undefined,
+    description: pickString(request.metadata, ["description"]) || undefined,
+    sessionID: request.sessionID,
   }
 }
 
