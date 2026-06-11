@@ -1,4 +1,4 @@
-import { mkdir, writeFile } from "node:fs/promises"
+import { mkdir, realpath, writeFile } from "node:fs/promises"
 import { dirname, resolve } from "node:path"
 
 import { log } from "./log"
@@ -40,15 +40,24 @@ async function execFile(command: string, args: string[], options: ExecOptions): 
   return { stdout, stderr, exitCode }
 }
 
-export async function ensureRepoReady(cwd: string, options: { includeDirty?: boolean; maxAttempts?: number } = {}) {
+export async function ensureRepoReady(cwd: string, options: { includeDirty?: boolean; maxAttempts?: number; baseRef?: string } = {}) {
   const rootResult = await execFile("git", ["rev-parse", "--show-toplevel"], { cwd, allowFailure: true })
   if (rootResult.exitCode !== 0) {
     throw new Error("archer must be run at the root of a git repo")
   }
 
-  const root = resolve(rootResult.stdout.trim())
-  if (root !== resolve(cwd)) {
+  // git reports the physical path; resolve symlinks on our side too so a
+  // symlinked --dir (e.g. /tmp on macOS) doesn't false-positive.
+  const root = await realpathSafe(rootResult.stdout.trim())
+  if (root !== (await realpathSafe(cwd))) {
     throw new Error(`archer must be run at the root of the git repo (${root})`)
+  }
+
+  if (options.baseRef) {
+    const base = await execFile("git", ["rev-parse", "--verify", "--quiet", `${options.baseRef}^{commit}`], { cwd, allowFailure: true })
+    if (base.exitCode !== 0) {
+      throw new Error(`base ref "${options.baseRef}" doesn't exist in this repo; pass --base <ref> (e.g. --base master)`)
+    }
   }
 
   const status = await execFile("git", ["status", "--porcelain"], { cwd })
@@ -79,6 +88,7 @@ export async function restoreRepoSnapshot(snapshot: RepoSnapshot, cwd: string) {
 export async function writeDiff(path: string, baseRef: string, cwd: string) {
   let diff = await execFile("git", ["diff", baseRef], { cwd, allowFailure: true })
   if (diff.exitCode !== 0) {
+    log.warn(`couldn't diff against "${baseRef}"; falling back to "git diff HEAD" (likely empty right after a commit). Pass --base <ref> to fix the phase diffs.`)
     diff = await execFile("git", ["diff", "HEAD"], { cwd, allowFailure: true })
   }
 
@@ -139,11 +149,30 @@ export function findSuspiciousStagedFiles(porcelain: string): string[] {
   for (const raw of porcelain.split("\n")) {
     if (!raw) continue
     const code = raw.slice(0, 2)
-    if (!/[AMR?]/.test(code[0] ?? "") && !/[AM?]/.test(code[1] ?? "")) continue
+    if (!/[AMRCT?]/.test(code[0] ?? "") && !/[AMT?]/.test(code[1] ?? "")) continue
     const rest = raw.slice(3)
     const path = rest.includes(" -> ") ? rest.split(" -> ").pop()! : rest
-    const clean = path.replace(/^"|"$/g, "")
+    const clean = unquotePorcelainPath(path)
     if (secretPatterns.some((pattern) => pattern.test(clean))) out.push(clean)
   }
   return out
+}
+
+// git C-quotes paths with spaces or non-ASCII bytes; the secret patterns must
+// match the decoded name, not the escaped one ("\303\251" would never match).
+function unquotePorcelainPath(path: string) {
+  if (!(path.startsWith('"') && path.endsWith('"'))) return path
+  const escapes: Record<string, string> = { a: "\x07", b: "\b", f: "\f", n: "\n", r: "\r", t: "\t", v: "\v", "\\": "\\", '"': '"' }
+  return path.slice(1, -1).replace(/\\(?:([abfnrtv\\"])|([0-7]{1,3}))/g, (_, esc: string | undefined, octal: string | undefined) => {
+    if (octal) return String.fromCharCode(parseInt(octal, 8))
+    return escapes[esc ?? ""] ?? (esc ?? "")
+  })
+}
+
+async function realpathSafe(path: string) {
+  try {
+    return await realpath(path)
+  } catch {
+    return resolve(path)
+  }
 }

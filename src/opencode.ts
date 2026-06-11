@@ -1,7 +1,8 @@
 import "./polyfills"
 
-import { spawnSync } from "node:child_process"
+import { stat } from "node:fs/promises"
 import { createServer } from "node:net"
+import { homedir } from "node:os"
 
 import { createOpencodeClient, createOpencodeServer } from "@opencode-ai/sdk/v2"
 
@@ -39,7 +40,17 @@ function fetchWithoutIdleTimeout(request: Request) {
   return fetch(request, { timeout: false } as RequestInit)
 }
 
-export function openOpencodeSessionWindow(input: { url: string; targetDir: string; sessionID: string }) {
+export type SessionWindowBackend = "ghostty" | "terminal"
+
+// Async on purpose: this is called from the TUI's render path, and a sync
+// osascript call would freeze the dashboard while macOS opens the window.
+// Prefers Ghostty when installed; Terminal.app is the fallback that always
+// works on macOS. ARCHER_TERMINAL=ghostty|terminal forces a backend.
+export async function openOpencodeSessionWindow(input: {
+  url: string
+  targetDir: string
+  sessionID: string
+}): Promise<SessionWindowBackend> {
   if (process.platform !== "darwin") {
     throw new Error("opening a new OpenCode terminal window is currently implemented for macOS only")
   }
@@ -51,10 +62,57 @@ export function openOpencodeSessionWindow(input: { url: string; targetDir: strin
     .filter(Boolean)
     .join("; ")
 
+  const forced = process.env.ARCHER_TERMINAL?.toLowerCase()
+  if (forced === "terminal") {
+    await openInTerminalApp(command)
+    return "terminal"
+  }
+  if (forced === "ghostty" || (await ghosttyInstalled())) {
+    try {
+      await openInGhostty(command)
+      return "ghostty"
+    } catch (error) {
+      if (forced === "ghostty") throw error
+      // Best effort: Ghostty's macOS CLI has no window/tab IPC, so launch
+      // failures here are expected on some setups; Terminal always works.
+    }
+  }
+  await openInTerminalApp(command)
+  return "terminal"
+}
+
+async function ghosttyInstalled() {
+  const bundles = ["/Applications/Ghostty.app", `${homedir()}/Applications/Ghostty.app`]
+  for (const bundle of bundles) {
+    if (await exists(bundle)) return true
+  }
+  return Bun.which("ghostty") !== null
+}
+
+// `open -na` asks macOS to launch a new Ghostty instance; `-e` makes Ghostty
+// run the command. A login shell keeps the user's PATH for `opencode`.
+async function openInGhostty(command: string) {
+  await spawnChecked(["open", "-na", "Ghostty", "--args", "-e", "zsh", "-lc", command])
+}
+
+async function openInTerminalApp(command: string) {
   const script = `tell application "Terminal"\nactivate\ndo script ${appleScriptString(command)}\nend tell`
-  const result = spawnSync("osascript", ["-e", script], { encoding: "utf8" })
-  if (result.error) throw result.error
-  if (result.status !== 0) throw new Error(result.stderr.trim() || `osascript exited with status ${result.status}`)
+  await spawnChecked(["osascript", "-e", script])
+}
+
+async function spawnChecked(cmd: string[]) {
+  const proc = Bun.spawn(cmd, { stdin: "ignore", stdout: "ignore", stderr: "pipe" })
+  const [status, stderr] = await Promise.all([proc.exited, new Response(proc.stderr).text()])
+  if (status !== 0) throw new Error(stderr.trim() || `${cmd[0]} exited with status ${status}`)
+}
+
+async function exists(path: string) {
+  try {
+    await stat(path)
+    return true
+  } catch {
+    return false
+  }
 }
 
 async function freePort() {

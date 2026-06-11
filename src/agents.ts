@@ -16,6 +16,7 @@ export function opencodeConfig(runDir: string, targetDir = process.cwd()): Confi
       undefined,
       loadAgentPrompt("implementer", targetDir),
       runDir,
+      targetDir,
       false,
     ),
     "pattern-auditor": agentConfig(
@@ -23,6 +24,7 @@ export function opencodeConfig(runDir: string, targetDir = process.cwd()): Confi
       undefined,
       loadAgentPrompt("pattern-auditor", targetDir),
       runDir,
+      targetDir,
       false,
     ),
     "security-auditor": agentConfig(
@@ -30,6 +32,7 @@ export function opencodeConfig(runDir: string, targetDir = process.cwd()): Confi
       undefined,
       loadAgentPrompt("security-auditor", targetDir),
       runDir,
+      targetDir,
       false,
     ),
     "design-polisher": agentConfig(
@@ -37,6 +40,7 @@ export function opencodeConfig(runDir: string, targetDir = process.cwd()): Confi
       0.2,
       loadAgentPrompt("design-polisher", targetDir),
       runDir,
+      targetDir,
       false,
     ),
     "test-engineer": agentConfig(
@@ -44,6 +48,7 @@ export function opencodeConfig(runDir: string, targetDir = process.cwd()): Confi
       undefined,
       loadAgentPrompt("test-engineer", targetDir),
       runDir,
+      targetDir,
       false,
     ),
     "adversarial-reviewer": agentConfig(
@@ -51,6 +56,7 @@ export function opencodeConfig(runDir: string, targetDir = process.cwd()): Confi
       0.1,
       loadAgentPrompt("adversarial-reviewer", targetDir),
       runDir,
+      targetDir,
       false,
     ),
   } satisfies Record<AgentName, AgentConfig>
@@ -118,6 +124,7 @@ function agentConfig(
   temperature: number | undefined,
   prompt: string,
   runDir: string,
+  targetDir: string,
   webfetch: boolean,
 ): AgentConfig {
   return {
@@ -134,7 +141,7 @@ function agentConfig(
     permission: {
       edit: "allow",
       question: "deny",
-      bash: bashPolicy(),
+      bash: bashPolicy(targetDir),
       external_directory: {
         "*": "deny",
         [join(runDir, "**")]: "allow",
@@ -144,10 +151,11 @@ function agentConfig(
   }
 }
 
-export function bashPolicy(): Record<string, "allow" | "deny" | "ask"> {
-  const allow = [
-    // Flutter / Dart toolchain
-    "flutter analyze*",
+// Safe-by-default commands across the toolchains archer targets. Anything not
+// listed falls through to "ask" (or auto-accept when --yolo / shift+tab is on).
+export const baseAllowBashPatterns = [
+  // Flutter / Dart toolchain
+  "flutter analyze*",
     "flutter test*",
     "flutter pub get",
     "flutter pub upgrade",
@@ -205,6 +213,33 @@ export function bashPolicy(): Record<string, "allow" | "deny" | "ask"> {
     "bun --version",
     "node --version",
     "tsc --noEmit*",
+    "npm run format*",
+    "pnpm run format*",
+    "pnpm format*",
+    "yarn run format*",
+    "yarn format*",
+    "bun run format*",
+    // Python checks
+    "pytest*",
+    "python -m pytest*",
+    "python3 -m pytest*",
+    "ruff check*",
+    "ruff format*",
+    "mypy*",
+    // Go checks
+    "go test*",
+    "go vet*",
+    "go fmt*",
+    // Rust checks
+    "cargo test*",
+    "cargo check*",
+    "cargo fmt*",
+    "cargo clippy*",
+    // Make: only well-known read/check targets; bare "make*" could run anything
+    "make test",
+    "make lint",
+    "make check",
+    "make build",
     // Common E2E dry-run/listing commands
     "maestro test --dry-run*",
     "maestro --version",
@@ -217,14 +252,24 @@ export function bashPolicy(): Record<string, "allow" | "deny" | "ask"> {
     "git log*",
     "git show*",
     "git rev-parse*",
-    "git branch*",
+    // listing forms only: a bare "git branch*" would also allow -D/-m
+    "git branch",
+    "git branch -a",
+    "git branch -r",
+    "git branch -v",
+    "git branch -vv",
+    "git branch --list*",
+    "git branch --show-current",
     "git ls-files*",
     "git ls-tree*",
     "git config --get*",
     "git stash list*",
     "git remote -v",
     "git --version",
-    // generic read-only shell
+    // Generic read-only shell. Note the policy matches command prefixes, so
+    // shell redirection ("ls > file") can still write; that has to be caught
+    // by opencode itself, not by patterns. find is excluded on purpose: its
+    // -delete/-exec arguments execute arbitrary destructive commands.
     "pwd",
     "ls*",
     "cat*",
@@ -232,7 +277,6 @@ export function bashPolicy(): Record<string, "allow" | "deny" | "ask"> {
     "tail*",
     "grep*",
     "rg*",
-    "find*",
     "wc*",
     "echo*",
     "printf*",
@@ -241,10 +285,18 @@ export function bashPolicy(): Record<string, "allow" | "deny" | "ask"> {
     "file*",
     "tree*",
     "stat*",
+    "jq*",
+    "du -sh*",
     "true",
     "false",
-  ]
-  const deny = [
+]
+
+// Hard denylist. Never relaxed — --yolo and the shift+tab auto-accept toggle
+// only affect commands that would otherwise *ask*. This protects against
+// accidents (pushes, recursive deletes, installs), not against a malicious
+// agent: agents can edit repo code that later runs, so allowlisted scripts
+// imply trusting the repo contents anyway.
+export const denyBashPatterns = [
     // remote operations - always Archer's job
     "git push*",
     "git push",
@@ -254,8 +306,9 @@ export function bashPolicy(): Record<string, "allow" | "deny" | "ask"> {
     "git remote set-url*",
     "git remote rm*",
     "git remote remove*",
-    "gh*",
-    "gh ",
+    // exact + spaced forms so ghc/ghq and similar tools aren't denied too
+    "gh",
+    "gh *",
     // publishing / deployment
     "npm publish*",
     "yarn publish*",
@@ -290,13 +343,20 @@ export function bashPolicy(): Record<string, "allow" | "deny" | "ask"> {
     "rm -rf $HOME*",
     "rm -fr $HOME*",
     "rm -rf ${HOME}*",
+    "rm -fr ${HOME}*",
     // download-and-execute patterns
     "curl* | sh*",
     "curl* | bash*",
+    "curl* | zsh*",
     "wget* | sh*",
     "wget* | bash*",
+    "wget* | zsh*",
     "curl* |sh*",
     "curl* |bash*",
+    "curl* |zsh*",
+    "wget* |sh*",
+    "wget* |bash*",
+    "wget* |zsh*",
     // package install
     "npm install*",
     "npm i *",
@@ -313,14 +373,51 @@ export function bashPolicy(): Record<string, "allow" | "deny" | "ask"> {
     "cargo install*",
     "go install*",
     "gem install*",
-    // privilege escalation
+    // privilege escalation (exact + spaced forms: "su*" would deny supabase, subl…)
     "sudo*",
-    "su*",
-    "doas*",
-  ]
+    "su",
+    "su *",
+    "doas",
+    "doas *",
+]
+
+// Script names safe to run through the package manager; suffixes like
+// test:unit or build-storybook stay covered by the separator group.
+const safeScriptName = /^(test|lint|typecheck|type-check|check|build|format|validate)([:._-].*)?$/
+const dangerousScriptHint = /(deploy|publish|release|migrate|seed|reset)/i
+
+/** Exact allow patterns for the target repo's own package.json scripts that look like checks. */
+export function projectScriptAllowPatterns(targetDir = process.cwd()): string[] {
+  const path = join(targetDir, "package.json")
+  if (!isFile(path)) return []
+
+  let scripts: Record<string, unknown>
+  try {
+    scripts = (JSON.parse(readFileSync(path, "utf8")) as { scripts?: Record<string, unknown> }).scripts ?? {}
+  } catch {
+    return []
+  }
+
+  const out: string[] = []
+  for (const name of Object.keys(scripts)) {
+    if (!safeScriptName.test(name) || dangerousScriptHint.test(name)) continue
+    // Exact name plus a "name *" args form: "npm run build*" would also match
+    // an unrelated "build-and-push" script, the space keeps it scoped.
+    for (const runner of ["npm run", "pnpm run", "pnpm", "yarn run", "yarn", "bun run"]) {
+      out.push(`${runner} ${name}`, `${runner} ${name} *`)
+    }
+  }
+  return out
+}
+
+export function bashPolicy(targetDir = process.cwd()): Record<string, "allow" | "deny" | "ask"> {
   const policy: Record<string, "allow" | "deny" | "ask"> = {}
-  for (const pattern of deny) policy[pattern] = "deny"
-  for (const pattern of allow) policy[pattern] = "allow"
+  const denied = new Set(denyBashPatterns)
+  for (const pattern of denyBashPatterns) policy[pattern] = "deny"
+  for (const pattern of [...baseAllowBashPatterns, ...projectScriptAllowPatterns(targetDir)]) {
+    if (denied.has(pattern)) continue
+    policy[pattern] = "allow"
+  }
   policy["*"] = "ask"
   return policy
 }

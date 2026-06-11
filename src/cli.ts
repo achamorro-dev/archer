@@ -1,9 +1,13 @@
 import { readFile } from "node:fs/promises"
 import { resolve } from "node:path"
 
-import { defaultGptModel, defaultGptVariant } from "./phases"
+import { defaultGptModel, defaultGptVariant, phases } from "./phases"
 import { run } from "./runner"
+import { browseRuns } from "./runs"
 import type { RunOptions } from "./types"
+import { isValidRunID } from "./workspace"
+
+const phaseNames: string[] = phases.map((phase) => phase.name)
 
 type ParsedArgs = Omit<RunOptions, "prompt"> & {
   prompt?: string
@@ -11,7 +15,10 @@ type ParsedArgs = Omit<RunOptions, "prompt"> & {
   help?: boolean
 }
 
-export type CliCommand = { type: "help"; text: string } | { type: "run"; options: RunOptions }
+export type CliCommand =
+  | { type: "help"; text: string }
+  | { type: "run"; options: RunOptions }
+  | { type: "runs"; runID?: string }
 
 export async function parseAndRun(argv: string[]) {
   const command = await parseCommand(argv)
@@ -19,13 +26,39 @@ export async function parseAndRun(argv: string[]) {
     process.stdout.write(command.text)
     return
   }
+  if (command.type === "runs") {
+    const resolution = await browseRuns(command.runID)
+    if (resolution.type === "resume") await run(resumeOptions(resolution.runID, resolution.targetDir))
+    return
+  }
 
   await run(command.options)
 }
 
+// The browser resumes with default flags (the original run's flags aren't
+// recorded), but metadata recovers the repo the run was launched against.
+function resumeOptions(runID: string, targetDir?: string): RunOptions {
+  const { help: _help, prompt: _prompt, promptFile: _promptFile, ...defaults } = parseArgs([])
+  return { ...defaults, prompt: "", resumeRunID: runID, targetDir: targetDir ?? defaults.targetDir }
+}
+
 export async function parseCommand(argv: string[]): Promise<CliCommand> {
+  if (argv[0] === "runs") {
+    const rest = argv.slice(1)
+    if (rest.length > 1) throw new Error("usage: archer runs [run-id]")
+    if (rest[0] !== undefined && !isValidRunID(rest[0])) throw new Error(`invalid run id: ${rest[0]}`)
+    return { type: "runs", runID: rest[0] }
+  }
+
   const parsed = parseArgs(argv)
   if (parsed.help) return { type: "help", text: help() }
+
+  if (parsed.prompt && parsed.promptFile) {
+    throw new Error("use either a positional prompt or --prompt-file, not both")
+  }
+  if (parsed.resumeRunID && (parsed.prompt || parsed.promptFile)) {
+    throw new Error("--resume continues a previous run with its original PRD; it can't take a new prompt")
+  }
 
   let prompt = parsed.prompt ?? ""
   if (parsed.promptFile) {
@@ -58,6 +91,7 @@ export function parseArgs(argv: string[]): ParsedArgs {
     baseRef: "main",
     targetDir: process.cwd(),
     includeDirty: false,
+    yolo: false,
   }
   const positional: string[] = []
 
@@ -76,7 +110,9 @@ export function parseArgs(argv: string[]): ParsedArgs {
     const takeValue = () => {
       if (value !== undefined) return value
       const next = argv[++i]
-      if (!next) throw new Error(`${flag} requires a value`)
+      // A following flag is not a value; catching it here beats silently
+      // consuming it (e.g. `--prompt-file --only x`).
+      if (next === undefined || (next.startsWith("-") && next !== "-")) throw new Error(`${flag} requires a value`)
       return next
     }
 
@@ -94,10 +130,10 @@ export function parseArgs(argv: string[]): ParsedArgs {
         parsed.files.push(takeValue())
         break
       case "--only":
-        parsed.onlyPhases.push(...listValue(takeValue()))
+        parsed.onlyPhases.push(...phaseListValue(takeValue(), "--only"))
         break
       case "--skip":
-        parsed.skipPhases.push(...listValue(takeValue()))
+        parsed.skipPhases.push(...phaseListValue(takeValue(), "--skip"))
         break
       case "--resume":
         parsed.resumeRunID = takeValue()
@@ -107,6 +143,9 @@ export function parseArgs(argv: string[]): ParsedArgs {
         break
       case "--include-dirty":
         parsed.includeDirty = true
+        break
+      case "--yolo":
+        parsed.yolo = true
         break
       case "--model":
         parsed.modelOverride = takeValue()
@@ -172,6 +211,17 @@ function listValue(value: string) {
     .filter(Boolean)
 }
 
+// A typo here is expensive: --only runs nothing, --skip runs the phase anyway.
+function phaseListValue(value: string, flag: string) {
+  const names = listValue(value)
+  for (const name of names) {
+    if (phaseNames.includes(name)) continue
+    if (name === "human-review") throw new Error(`${flag}: human-review is not a pipeline phase; use --no-human-review to disable the manual gate`)
+    throw new Error(`${flag}: unknown phase "${name}" (valid: ${phaseNames.join(", ")})`)
+  }
+  return names
+}
+
 function help() {
   return `archer [prompt]
 
@@ -180,14 +230,20 @@ Sequential OpenCode agent pipeline for implementing features.
 Usage:
   archer "Add onboarding"
   archer --prompt-file prd.md --file lib/onboarding --file test/onboarding_test.dart
+  archer runs [run-id]
+
+Commands:
+  runs [run-id]            Browse run history: resume a run, read its summary/reports,
+                           or open a subshell in its run dir (under ~/.archer/runs)
 
 Flags:
   --prompt-file <path>     Read the PRD/prompt from a file
   --file, -f <path>        Attach a file or directory to all phases (repeatable)
   --only <phases>          Run only these phases (implementer,patterns,security,design,tests,adversarial)
   --skip <phases>          Skip these phases
-  --resume <id>            Resume a previous run by its ID
+  --resume <id>            Resume a previous run by its ID (phases with an existing report are skipped)
   --keep-run-dir           Don't delete the run dir when done
+  --yolo                   Auto-allow ask-level permissions (hard denylist still applies; shift+tab toggles it live in the TUI)
   --include-dirty          Include existing changes in the first commit (requires --max-attempts 1)
   --model <provider/model> Force a model for all phases
   --tui                    Show visual phase progress (default in interactive terminals)

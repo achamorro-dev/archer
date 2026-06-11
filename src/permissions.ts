@@ -4,7 +4,7 @@ import { createInterface } from "node:readline/promises"
 import type { OpencodeClient } from "@opencode-ai/sdk/v2"
 
 import { log } from "./log"
-import { noopProgress, type PermissionPromptInfo, type PermissionReply, type ProgressUI } from "./progress"
+import { noopProgress, type AutoAccept, type PermissionPromptInfo, type PermissionReply, type ProgressUI } from "./progress"
 
 type PermissionRequest = {
   id: string
@@ -20,6 +20,9 @@ type Reply = PermissionReply
 
 export type PermissionGate = {
   stop(): Promise<void>
+  /** While paused, permission requests are left for whoever owns the terminal (e.g. an interactive OpenCode TUI). */
+  pause(): void
+  resume(): void
 }
 
 export type StartGateOptions = {
@@ -27,6 +30,8 @@ export type StartGateOptions = {
   progress?: ProgressUI
   interactive: boolean
   directory: string
+  /** When enabled, ask-level requests are auto-allowed ("once") instead of prompting. */
+  autoAccept?: AutoAccept
 }
 
 export function startPermissionGate(options: StartGateOptions): PermissionGate {
@@ -34,6 +39,7 @@ export function startPermissionGate(options: StartGateOptions): PermissionGate {
   const controller = new AbortController()
   const handled = new Set<string>()
   const queue = serialQueue()
+  let paused = false
   let listenerDone: Promise<void> = Promise.resolve()
 
   const loop = async () => {
@@ -46,10 +52,11 @@ export function startPermissionGate(options: StartGateOptions): PermissionGate {
           if (controller.signal.aborted) return
           const payload = event && typeof event === "object" && "payload" in event ? (event as { payload?: unknown }).payload : event
           if (!isPermissionAsked(payload)) continue
+          if (paused) continue
           const request = payload.properties
           if (handled.has(request.id)) continue
           handled.add(request.id)
-          queue(() => handleRequest(options.client, request, options.interactive, progress))
+          queue(() => handleRequest(options.client, request, options.interactive, progress, options.directory, options.autoAccept))
         }
       } catch (error) {
         if (controller.signal.aborted) return
@@ -72,6 +79,12 @@ export function startPermissionGate(options: StartGateOptions): PermissionGate {
         // ignore
       }
     },
+    pause() {
+      paused = true
+    },
+    resume() {
+      paused = false
+    },
   }
 }
 
@@ -83,11 +96,27 @@ function isPermissionAsked(payload: unknown): payload is { type: "permission.ask
   return Boolean(properties && typeof properties === "object" && "id" in properties)
 }
 
-async function handleRequest(client: OpencodeClient, request: PermissionRequest, interactive: boolean, progress: ProgressUI) {
+async function handleRequest(
+  client: OpencodeClient,
+  request: PermissionRequest,
+  interactive: boolean,
+  progress: ProgressUI,
+  directory: string,
+  autoAccept?: AutoAccept,
+) {
   const summary = describeRequest(request)
+  // Read at handling time, not subscription time: the TUI flips this live.
+  // Opencode's denylist already rejected anything hard-denied, so whatever
+  // reaches here is exactly the "ask" bucket auto-accept is meant to cover.
+  if (autoAccept?.enabled) {
+    log.info(`[permission] auto-allowed (auto-accept on): ${summary}`)
+    progress.message(`auto-allowed: ${summary}`)
+    await reply(client, request.id, directory, "once")
+    return
+  }
   if (!interactive) {
     log.warn(`[permission] auto-rejecting ${request.permission} (no TTY): ${summary}`)
-    await reply(client, request.id, "reject", "Archer rejected: non-interactive run")
+    await reply(client, request.id, directory, "reject", "Archer rejected: non-interactive run")
     return
   }
 
@@ -97,7 +126,7 @@ async function handleRequest(client: OpencodeClient, request: PermissionRequest,
   if (ask) {
     const answer = await ask(promptInfo(request))
     log.info(`[permission] replied ${answer} for ${request.permission}`)
-    await reply(client, request.id, answer, answer === "reject" ? "rejected by user" : undefined)
+    await reply(client, request.id, directory, answer, answer === "reject" ? "rejected by user" : undefined)
     return
   }
 
@@ -107,7 +136,7 @@ async function handleRequest(client: OpencodeClient, request: PermissionRequest,
     stdout.write(formatRequest(request))
     const answer = await askReply()
     log.info(`[permission] replied ${answer} for ${request.permission}`)
-    await reply(client, request.id, answer, answer === "reject" ? "rejected by user" : undefined)
+    await reply(client, request.id, directory, answer, answer === "reject" ? "rejected by user" : undefined)
   } finally {
     progress.resume()
   }
@@ -125,8 +154,10 @@ function promptInfo(request: PermissionRequest): PermissionPromptInfo {
   }
 }
 
-async function reply(client: OpencodeClient, requestID: string, choice: Reply, message?: string) {
-  const result = await client.permission.reply({ requestID, reply: choice, ...(message ? { message } : {}) })
+async function reply(client: OpencodeClient, requestID: string, directory: string, choice: Reply, message?: string) {
+  // The reply must carry the same directory scope as the session that asked,
+  // or a server hosting multiple instances routes it to the wrong one.
+  const result = await client.permission.reply({ requestID, directory, reply: choice, ...(message ? { message } : {}) })
   if (result.error) log.warn(`[permission] reply error for ${requestID}: ${String((result.error as { message?: unknown }).message ?? result.error)}`)
 }
 

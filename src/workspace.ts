@@ -69,14 +69,13 @@ function validateRunID(runID: string) {
   if (!isValidRunID(runID)) throw new Error(`invalid run id: ${runID}`)
 }
 
+// Local time, not UTC: run IDs are read by humans next to their wall clock.
 function newRunID() {
   const now = new Date()
-  const stamp = now
-    .toISOString()
-    .replace(/[-:]/g, "")
-    .replace(/T/, "-")
-    .slice(0, 15)
-  return `${stamp}-${randomSlug(4)}`
+  const pad = (value: number) => String(value).padStart(2, "0")
+  const date = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}`
+  const time = `${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`
+  return `${date}-${time}-${randomSlug(4)}`
 }
 
 function randomSlug(size: number) {

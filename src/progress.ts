@@ -50,6 +50,23 @@ export type ProgressDiffSummary = {
 
 export type PermissionReply = "once" | "always" | "reject"
 
+/**
+ * Shared mutable switch between the permission gate and the TUI: when enabled,
+ * ask-level permissions are auto-allowed ("once"). The opencode-level denylist
+ * is unaffected — denied commands never reach the gate at all.
+ * Seeded by --yolo and toggled live with shift+tab in the dashboard.
+ */
+export type AutoAccept = { enabled: boolean }
+
+export type ProgressPhaseSnapshot = {
+  status: "completed" | "skipped" | "failed"
+  sessionID?: string
+  durationMs?: number
+  cost?: number
+  tokens?: ProgressTokens
+  model?: string
+}
+
 export type PermissionPromptInfo = {
   id: string
   permission: string
@@ -75,6 +92,8 @@ export type ProgressUI = {
   phaseCompleted(name: string, detail?: string): void
   phaseSkipped(name: string): void
   phaseFailed(name: string, detail?: string): void
+  /** Replays a phase finished in a previous run (--resume) with its real duration, cost, and session. */
+  phaseRestored(name: string, snapshot: ProgressPhaseSnapshot): void
   /** When present, the UI resolves permission prompts itself (no terminal fallback). */
   askPermission?(info: PermissionPromptInfo): Promise<PermissionReply>
   message(message: string): void
@@ -97,18 +116,24 @@ export const noopProgress: ProgressUI = {
   phaseCompleted() {},
   phaseSkipped() {},
   phaseFailed() {},
+  phaseRestored() {},
   message() {},
   suspend() {},
   resume() {},
   stop() {},
 }
 
-export async function createProgressUI(phases: readonly ProgressPhase[], enabled: boolean, onAbort?: () => void): Promise<ProgressUI> {
+export async function createProgressUI(
+  phases: readonly ProgressPhase[],
+  enabled: boolean,
+  onAbort?: () => void,
+  autoAccept?: AutoAccept,
+): Promise<ProgressUI> {
   if (!enabled || !process.stdout.isTTY) return noopProgress
 
   try {
     const { createTuiProgress } = await import("./tui")
-    const progress = await createTuiProgress(phases, onAbort)
+    const progress = await createTuiProgress(phases, onAbort, autoAccept)
     log.mute(true)
     return progress
   } catch (error) {

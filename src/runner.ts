@@ -8,6 +8,7 @@ import { fileParts } from "./attachments"
 import { addAllAndCommit, createCleanRepoSnapshot, ensureRepoReady, restoreRepoSnapshot, type RepoSnapshot, writeDiff } from "./git"
 import { runHumanReviewGate } from "./human"
 import { log } from "./log"
+import { openRunMetadata, recordProgress, type RunMetadataStore } from "./metadata"
 import { startOpencode } from "./opencode"
 import { startPermissionGate, type PermissionGate } from "./permissions"
 import { phases } from "./phases"
@@ -15,6 +16,7 @@ import {
   createProgressUI,
   noopProgress,
   type ActivityKind,
+  type AutoAccept,
   type ProgressDiffSummary,
   type ProgressPhase,
   type ProgressStepUsage,
@@ -126,7 +128,7 @@ class RunShutdown {
 function installShutdownSignals(shutdown: RunShutdown) {
   // Bun delivers the numeric signal value to handlers; normalize for logs.
   const handler = (signal: NodeJS.Signals | number) =>
-    shutdown.request(typeof signal === "number" ? (signal === 15 ? "SIGTERM" : "SIGINT") : signal)
+    shutdown.request(typeof signal === "number" ? (signal === 15 ? "SIGTERM" : signal === 2 ? "SIGINT" : `signal ${signal}`) : signal)
   process.on("SIGINT", handler)
   process.on("SIGTERM", handler)
   return () => {
@@ -136,7 +138,7 @@ function installShutdownSignals(shutdown: RunShutdown) {
 }
 
 export async function run(options: RunOptions) {
-  await ensureRepoReady(options.targetDir, { includeDirty: options.includeDirty, maxAttempts: options.maxAttempts })
+  await ensureRepoReady(options.targetDir, { includeDirty: options.includeDirty, maxAttempts: options.maxAttempts, baseRef: options.baseRef })
 
   const workspace = options.resumeRunID
     ? await resumeWorkspace(options.resumeRunID)
@@ -146,13 +148,24 @@ export async function run(options: RunOptions) {
   let opencode: Awaited<ReturnType<typeof startOpencode>> | undefined
   let progress: ProgressUI = noopProgress
   let permissions: PermissionGate | undefined
+  let metadata: RunMetadataStore | undefined
   const shutdown = new RunShutdown()
   const removeSignalHandlers = installShutdownSignals(shutdown)
 
+  const autoAccept: AutoAccept = { enabled: options.yolo }
+
   try {
-    progress = await createProgressUI(progressPhases(options), options.tui, () => shutdown.request("Ctrl+C"))
+    metadata = await openRunMetadata(workspace, options.targetDir)
+    progress = recordProgress(
+      await createProgressUI(progressPhases(options), options.tui, () => shutdown.request("Ctrl+C"), autoAccept),
+      metadata,
+    )
     progress.start(workspace.runID, options.targetDir)
     log.info(`Run ${workspace.runID} - dir: ${workspace.dir}`)
+    if (options.yolo) {
+      progress.message("YOLO enabled: ask-level permissions will be auto-allowed (denylist still applies); shift+tab toggles")
+      log.warn("YOLO enabled: unknown non-denied commands will be auto-allowed")
+    }
 
     const extraFiles = await fileParts(options.files, options.targetDir, "error")
     if (extraFiles.length > 0) log.info(`User attachments: ${extraFiles.map((file) => file.filename).join(", ")}`)
@@ -178,8 +191,10 @@ export async function run(options: RunOptions) {
       progress,
       interactive: Boolean(process.stdin.isTTY && process.stdout.isTTY),
       directory: options.targetDir,
+      autoAccept,
     })
 
+    const resuming = Boolean(options.resumeRunID)
     for (const phase of phases) {
       shutdown.throwIfRequested()
       if (shouldSkip(phase.name, options)) {
@@ -188,8 +203,15 @@ export async function run(options: RunOptions) {
         log.warn(`[${phase.name}] skipped by flag`)
         continue
       }
-      await runPhase(opencode.client, workspace, phase, options, extraFiles, projectContextFiles, progress, shutdown)
-      if (phase.name === "implementer") await runHumanReviewGate(workspace, options, opencode.url, progress)
+      if (resuming && (await exists(join(workspace.dir, phase.reportPath)))) {
+        const snapshot = metadata.snapshot(phase.name)
+        if (snapshot) progress.phaseRestored(phase.name, snapshot)
+        else progress.phaseCompleted(phase.name, "already completed in previous run")
+        log.info(`[${phase.name}] report exists; skipping on resume`)
+      } else {
+        await runPhase(opencode.client, workspace, phase, options, extraFiles, projectContextFiles, progress, shutdown)
+      }
+      if (phase.name === "implementer") await runHumanReviewGate(workspace, options, opencode.url, progress, permissions)
     }
 
     progress.message("writing run summary")
@@ -201,6 +223,7 @@ export async function run(options: RunOptions) {
     removeSignalHandlers()
     if (shutdown.aborted) await shutdown.abortActiveSession(progress)
     await permissions?.stop()
+    await metadata?.flush().catch((error) => log.warn(`couldn't flush run metadata: ${String(error)}`))
     progress.stop()
     shutdown.dispose()
 
@@ -424,6 +447,7 @@ async function promptPhase(
   const session = await client.session.create({
     directory: input.targetDir,
     title: `archer ${input.workspace.runID} ${input.phase.name}`,
+    metadata: { archerRunID: input.workspace.runID, archerPhase: input.phase.name },
   }, { signal: input.shutdown.signal })
   if (session.error) throw new Error(formatSdkError(session.error))
   if (!session.data?.id) throw new Error("opencode didn't return session id")

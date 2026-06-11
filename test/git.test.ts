@@ -44,4 +44,9 @@ describe("findSuspiciousStagedFiles", () => {
     const porcelain = `R  config/old.txt -> config/credentials.json`
     expect(findSuspiciousStagedFiles(porcelain)).toEqual(["config/credentials.json"])
   })
+
+  test("decodes C-quoted porcelain paths before matching", () => {
+    const porcelain = ['A  "secret dir/.env"', 'A  "caf\\303\\251/.env"'].join("\n")
+    expect(findSuspiciousStagedFiles(porcelain)).toEqual(["secret dir/.env", "cafÃ©/.env"])
+  })
 })

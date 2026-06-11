@@ -16,6 +16,8 @@ export type RunOptions = {
   baseRef: string
   targetDir: string
   includeDirty: boolean
+  /** Start with auto-accept enabled: ask-level permissions are allowed without prompting (denylist still applies). */
+  yolo: boolean
 }
 
 export type Phase = {

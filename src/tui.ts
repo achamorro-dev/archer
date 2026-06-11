@@ -16,10 +16,12 @@ import { openOpencodeSessionWindow } from "./opencode"
 import type { BoxOptions, CliRenderer, KeyEvent, TextChunk } from "@opentui/core"
 import type {
   ActivityKind,
+  AutoAccept,
   PermissionPromptInfo,
   PermissionReply,
   ProgressDiffSummary,
   ProgressPhase,
+  ProgressPhaseSnapshot,
   ProgressStepUsage,
   ProgressTodo,
   ProgressTokens,
@@ -27,7 +29,30 @@ import type {
   ProgressUsage,
 } from "./progress"
 
-const theme = {
+type Palette = {
+  bg: string
+  panel: string
+  panelAlt: string
+  border: string
+  borderDim: string
+  accent: string
+  teal: string
+  green: string
+  red: string
+  yellow: string
+  orange: string
+  magenta: string
+  cyan: string
+  text: string
+  dim: string
+  faint: string
+  /** Text drawn on top of colored chips (selected permission buttons). */
+  chipText: string
+}
+
+type PaletteColor = Exclude<keyof Palette, "chipText">
+
+const darkPalette: Palette = {
   bg: "#0A0E1A",
   panel: "#101626",
   panelAlt: "#0D1320",
@@ -44,31 +69,89 @@ const theme = {
   text: "#C0CAF5",
   dim: "#565F89",
   faint: "#3B4261",
+  chipText: "#0A0E1A",
 }
 
-const kindStyle: Record<ActivityKind, { icon: string; color: string }> = {
-  tool: { icon: "⚒", color: theme.cyan },
-  bash: { icon: "$", color: theme.green },
-  think: { icon: "✻", color: theme.magenta },
-  write: { icon: "✎", color: theme.accent },
-  step: { icon: "▸", color: theme.teal },
-  retry: { icon: "↻", color: theme.yellow },
-  permission: { icon: "⚿", color: theme.yellow },
-  todo: { icon: "☑", color: theme.teal },
-  diff: { icon: "±", color: theme.orange },
-  error: { icon: "✗", color: theme.red },
-  info: { icon: "·", color: theme.dim },
-  system: { icon: "◆", color: theme.dim },
+const lightPalette: Palette = {
+  bg: "#E1E2E7",
+  panel: "#E9E9EC",
+  panelAlt: "#DFE0E5",
+  border: "#A8AECB",
+  borderDim: "#C1C6DD",
+  accent: "#2E7DE9",
+  teal: "#118C74",
+  green: "#587539",
+  red: "#F52A65",
+  yellow: "#8C6C3E",
+  orange: "#B15C00",
+  magenta: "#7847BD",
+  cyan: "#007197",
+  text: "#343B58",
+  dim: "#6172B0",
+  faint: "#9DA3C2",
+  chipText: "#E1E2E7",
+}
+
+// When the terminal never answers the background query, paint no backgrounds
+// at all and stick to mid-brightness colors that read on dark and light.
+const neutralPalette: Palette = {
+  bg: "transparent",
+  panel: "transparent",
+  panelAlt: "transparent",
+  border: "#808080",
+  borderDim: "#6E6E6E",
+  accent: "#4F9CF9",
+  teal: "#27AE9D",
+  green: "#6FAE4F",
+  red: "#E0606C",
+  yellow: "#B59B3A",
+  orange: "#CE8633",
+  magenta: "#A985D6",
+  cyan: "#3FA7C4",
+  text: "#9E9E9E",
+  dim: "#7A7A7A",
+  faint: "#616161",
+  chipText: "#000000",
+}
+
+// Module-level on purpose: one TUI exists per archer process, and a mutable
+// palette spares threading it through every render helper below.
+let theme: Palette = darkPalette
+
+export function paletteForMode(mode: "dark" | "light" | null | undefined): Palette {
+  if (mode === "light") return lightPalette
+  if (mode === "dark") return darkPalette
+  return neutralPalette
+}
+
+const kindStyles: Record<ActivityKind, { icon: string; color: PaletteColor }> = {
+  tool: { icon: "⚒", color: "cyan" },
+  bash: { icon: "$", color: "green" },
+  think: { icon: "✻", color: "magenta" },
+  write: { icon: "✎", color: "accent" },
+  step: { icon: "▸", color: "teal" },
+  retry: { icon: "↻", color: "yellow" },
+  permission: { icon: "⚿", color: "yellow" },
+  todo: { icon: "☑", color: "teal" },
+  diff: { icon: "±", color: "orange" },
+  error: { icon: "✗", color: "red" },
+  info: { icon: "·", color: "dim" },
+  system: { icon: "◆", color: "dim" },
+}
+
+function kindStyle(kind: ActivityKind): { icon: string; color: string } {
+  const style = kindStyles[kind]
+  return { icon: style.icon, color: theme[style.color] }
 }
 
 const spinnerFrames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 const pipelineWidth = 32
 const feedLimit = 100
 
-const permissionChoices: ReadonlyArray<{ reply: PermissionReply; label: string; color: string }> = [
-  { reply: "once", label: "allow once", color: theme.green },
-  { reply: "always", label: "always allow", color: theme.accent },
-  { reply: "reject", label: "reject", color: theme.red },
+const permissionChoices: ReadonlyArray<{ reply: PermissionReply; label: string; color: PaletteColor }> = [
+  { reply: "once", label: "allow once", color: "green" },
+  { reply: "always", label: "always allow", color: "accent" },
+  { reply: "reject", label: "reject", color: "red" },
 ]
 
 type PhaseStatus = "pending" | "running" | "completed" | "skipped" | "failed"
@@ -98,6 +181,8 @@ type PhaseState = ProgressPhase & {
   diff?: ProgressDiffSummary
   startedAt?: number
   endedAt?: number
+  /** Real duration replayed from a previous run; set only by phaseRestored. */
+  restoredDurationMs?: number
   updatedAt: number
 }
 
@@ -113,15 +198,22 @@ type PendingPermission = {
   resolve: (reply: PermissionReply) => void
 }
 
-export async function createTuiProgress(phases: readonly ProgressPhase[], onAbort?: () => void): Promise<ProgressUI> {
+export async function createTuiProgress(
+  phases: readonly ProgressPhase[],
+  onAbort?: () => void,
+  autoAccept?: AutoAccept,
+): Promise<ProgressUI> {
+  // No backgroundColor yet: the palette is only chosen after the terminal
+  // answers the background query, so a light terminal never flashes dark.
   const renderer = await createCliRenderer({
     screenMode: "alternate-screen",
     consoleMode: "console-overlay",
     exitOnCtrlC: false,
     targetFps: 12,
-    backgroundColor: theme.bg,
   })
-  return new TuiProgress(renderer, phases, onAbort)
+  const mode = await renderer.waitForThemeMode(1_000).catch(() => null)
+  theme = paletteForMode(mode)
+  return new TuiProgress(renderer, phases, onAbort, autoAccept)
 }
 
 export class TuiProgress implements ProgressUI {
@@ -137,14 +229,29 @@ export class TuiProgress implements ProgressUI {
   private readonly ticker: ReturnType<typeof setInterval>
   private readonly headerText: TextRenderable
   private readonly pipelineText: TextRenderable
-  private readonly sessionText: TextRenderable
   private readonly feedText: TextRenderable
   private readonly footerText: TextRenderable
+  // Rebuilt on every pipeline render: panel row index → phase name, so clicks
+  // resolve against exactly what is on screen (the active phase adds a row).
+  private pipelineRowPhases: (string | undefined)[] = []
   private readonly overlay: BoxRenderable
   private readonly modal: BoxRenderable
   private readonly modalText: TextRenderable
+  // Panels repainted when the terminal reports a theme change mid-run.
+  private readonly paletteTargets: Array<{ box: BoxRenderable; background: PaletteColor; border?: PaletteColor }> = []
   private readonly permissionQueue: PendingPermission[] = []
   private permissionChoice = 0
+  // Suspension nests: outer scopes (human-review gate) and inner prompts may
+  // both suspend; only the outermost transition touches the renderer.
+  private suspendDepth = 0
+  private readonly handleThemeMode = (mode: unknown) => {
+    if (mode !== "dark" && mode !== "light") return
+    theme = paletteForMode(mode)
+    this.applyPalette()
+    this.addEvent("archer", "system", `terminal theme changed: ${mode}`)
+    this.render()
+  }
+
   private readonly handleKeyPress = (key: KeyEvent) => {
     if ((key.ctrl && key.name === "c") || key.raw === "\u0003") {
       key.preventDefault()
@@ -152,6 +259,14 @@ export class TuiProgress implements ProgressUI {
       this.addEvent("archer", "system", "ctrl+c received; shutting down")
       this.render()
       this.onAbort?.()
+      return
+    }
+    // Checked before the permission modal so the toggle also resolves an
+    // open prompt (enabling auto-accept flushes the whole queue).
+    if (key.name === "tab" && key.shift) {
+      key.preventDefault()
+      key.stopPropagation()
+      this.toggleAutoAccept()
       return
     }
     if (this.permissionQueue.length > 0) {
@@ -168,6 +283,7 @@ export class TuiProgress implements ProgressUI {
     private readonly renderer: CliRenderer,
     phases: readonly ProgressPhase[],
     private readonly onAbort?: () => void,
+    private readonly autoAccept?: AutoAccept,
   ) {
     this.phases = phases.map((phase) => ({
       ...phase,
@@ -211,6 +327,13 @@ export class TuiProgress implements ProgressUI {
       gap: 1,
     })
 
+    const openFromPipeline = (event: { y: number; preventDefault(): void; stopPropagation(): void }) => {
+      event.preventDefault()
+      event.stopPropagation()
+      const name = this.pipelineRowPhases[event.y - this.pipelineText.y]
+      if (name) this.openSessionWindowForPhase(name, "click")
+    }
+
     const pipeline = this.panel({
       id: "archer-pipeline",
       width: pipelineWidth,
@@ -219,30 +342,14 @@ export class TuiProgress implements ProgressUI {
       backgroundColor: theme.panelAlt,
       title: " pipeline ",
       titleAlignment: "left",
+      onMouseDown: openFromPipeline,
     })
-
-    const right = new BoxRenderable(renderer, {
-      id: "archer-right",
-      height: "100%",
-      flexGrow: 1,
-      flexDirection: "column",
-      gap: 0,
-    })
-
-    const session = this.panel({
-      id: "archer-session",
-      height: 10,
-      width: "100%",
-      borderColor: theme.border,
-      backgroundColor: theme.panel,
-      title: " current phase ",
-      titleAlignment: "left",
-    })
+    pipeline.text.onMouseDown = openFromPipeline
 
     const feed = this.panel({
       id: "archer-feed",
+      height: "100%",
       flexGrow: 1,
-      width: "100%",
       borderColor: theme.borderDim,
       backgroundColor: theme.panelAlt,
       title: " activity ",
@@ -266,14 +373,19 @@ export class TuiProgress implements ProgressUI {
 
     this.headerText = header.text
     this.pipelineText = pipeline.text
-    this.sessionText = session.text
     this.feedText = feed.text
     this.footerText = footer.text
 
-    right.add(session.box)
-    right.add(feed.box)
+    this.paletteTargets.push(
+      { box: shell, background: "bg" },
+      { box: header.box, background: "panel", border: "border" },
+      { box: pipeline.box, background: "panelAlt", border: "borderDim" },
+      { box: feed.box, background: "panelAlt", border: "borderDim" },
+      { box: footer.box, background: "panel", border: "borderDim" },
+    )
+
     body.add(pipeline.box)
-    body.add(right)
+    body.add(feed.box)
     shell.add(header.box)
     shell.add(body)
     shell.add(footer.box)
@@ -308,8 +420,10 @@ export class TuiProgress implements ProgressUI {
     this.modal.add(this.modalText)
     this.overlay.add(this.modal)
     renderer.root.add(this.overlay)
+    this.paletteTargets.push({ box: this.modal, background: "panel", border: "yellow" })
 
     renderer.keyInput.on("keypress", this.handleKeyPress)
+    renderer.on("theme_mode", this.handleThemeMode)
 
     this.ticker = setInterval(() => this.render(), 250)
     this.render()
@@ -429,8 +543,44 @@ export class TuiProgress implements ProgressUI {
     this.addEvent(name, "error", detail || "failed")
   }
 
+  phaseRestored(name: string, snapshot: ProgressPhaseSnapshot) {
+    const phase = this.findPhase(name)
+    if (!phase) return
+    // Written directly instead of via setPhase: a restored phase must not
+    // claim the active slot or reset the quiet timer of the live run.
+    phase.status = snapshot.status
+    phase.detail = "restored from previous run"
+    phase.sessionID = snapshot.sessionID ?? ""
+    phase.restoredDurationMs = snapshot.durationMs
+    if (snapshot.cost !== undefined || snapshot.tokens) {
+      const session = this.usageSession(phase, snapshot.sessionID || "restored")
+      session.cost = safeCost(snapshot.cost)
+      if (snapshot.tokens) session.tokens = cloneTokens(snapshot.tokens)
+      session.model = snapshot.model ?? ""
+      session.reported = true
+      session.totalReported = true
+      this.recalculateUsage(phase)
+    }
+    if (snapshot.model) phase.lastStepModel = snapshot.model
+    phase.updatedAt = Date.now()
+    const parts = [
+      snapshot.durationMs !== undefined ? formatElapsed(snapshot.durationMs) : "",
+      snapshot.cost !== undefined ? formatMoney(snapshot.cost) : "",
+      snapshot.sessionID ? `session ${shortID(snapshot.sessionID)}` : "",
+    ].filter(Boolean)
+    this.addEvent(name, "system", `restored from previous run${parts.length > 0 ? ` (${parts.join(", ")})` : ""}`)
+    this.render()
+  }
+
   askPermission(info: PermissionPromptInfo): Promise<PermissionReply> {
     if (this.renderer.isDestroyed) return Promise.resolve("reject")
+    // The gate checks auto-accept before prompting, but the toggle can flip
+    // between that check and this call; never show a prompt in auto mode.
+    if (this.autoAccept?.enabled) {
+      this.addEvent("archer", "permission", `auto-allowed: ${permissionSummary(info)}`)
+      this.render()
+      return Promise.resolve("once")
+    }
     return new Promise((resolve) => {
       this.permissionQueue.push({ info, resolve })
       if (this.permissionQueue.length === 1) this.permissionChoice = 0
@@ -447,12 +597,15 @@ export class TuiProgress implements ProgressUI {
 
   suspend() {
     if (this.renderer.isDestroyed) return
+    if (this.suspendDepth++ > 0) return
     log.mute(false)
     this.renderer.suspend()
   }
 
   resume() {
     if (this.renderer.isDestroyed) return
+    if (this.suspendDepth === 0) return
+    if (--this.suspendDepth > 0) return
     log.mute(true)
     this.renderer.resume()
     this.render()
@@ -462,9 +615,17 @@ export class TuiProgress implements ProgressUI {
     clearInterval(this.ticker)
     log.mute(false)
     this.renderer.keyInput.off("keypress", this.handleKeyPress)
+    this.renderer.off("theme_mode", this.handleThemeMode)
     for (const pending of this.permissionQueue.splice(0)) pending.resolve("reject")
     if (this.renderer.isDestroyed) return
     this.renderer.destroy()
+  }
+
+  private applyPalette() {
+    for (const target of this.paletteTargets) {
+      target.box.backgroundColor = theme[target.background]
+      if (target.border) target.box.borderColor = theme[target.border]
+    }
   }
 
   private panel(options: BoxOptions) {
@@ -516,6 +677,26 @@ export class TuiProgress implements ProgressUI {
     this.render()
   }
 
+  private toggleAutoAccept() {
+    if (!this.autoAccept) return
+    this.autoAccept.enabled = !this.autoAccept.enabled
+    this.addEvent(
+      "archer",
+      "permission",
+      this.autoAccept.enabled
+        ? "auto-accept ON: ask-level permissions will be allowed (denylist still applies)"
+        : "auto-accept OFF: permissions prompt again",
+    )
+    if (this.autoAccept.enabled) {
+      for (const pending of this.permissionQueue.splice(0)) {
+        this.addEvent("archer", "permission", `auto-allowed: ${permissionSummary(pending.info)}`)
+        pending.resolve("once")
+      }
+      this.permissionChoice = 0
+    }
+    this.render()
+  }
+
   private resolvePermission(reply: PermissionReply) {
     const pending = this.permissionQueue.shift()
     if (!pending) return
@@ -528,23 +709,38 @@ export class TuiProgress implements ProgressUI {
 
   private openActiveSessionWindow(source: "click" | "key") {
     const active = this.findPhase(this.activePhase) ?? this.phases.find((phase) => phase.status === "running")
+    if (!active) {
+      this.addEvent("archer", "system", "no active opencode session to open yet")
+      this.render()
+      return
+    }
+    this.openSessionWindowForPhase(active.name, source)
+  }
+
+  private openSessionWindowForPhase(name: string, source: "click" | "key") {
+    const phase = this.findPhase(name)
+    if (!phase) return
     if (!this.serverUrl) {
       this.addEvent("archer", "system", "opencode server is not ready yet")
       this.render()
       return
     }
-    if (!active?.sessionID) {
-      this.addEvent("archer", "system", "no active opencode session to open yet")
+    if (!phase.sessionID) {
+      this.addEvent("archer", "system", `no opencode session for ${name} yet`)
       this.render()
       return
     }
 
-    try {
-      openOpencodeSessionWindow({ url: this.serverUrl, targetDir: this.targetDir || process.cwd(), sessionID: active.sessionID })
-      this.addEvent("archer", "system", `${source === "key" ? "[o]" : "click"}: opening ${active.name} session ${shortID(active.sessionID)}`)
-    } catch (error) {
-      this.addEvent("archer", "error", `couldn't open opencode session: ${error instanceof Error ? error.message : String(error)}`)
-    }
+    this.addEvent("archer", "system", `${source === "key" ? "[o]" : "click"}: opening ${name} session ${shortID(phase.sessionID)}`)
+    openOpencodeSessionWindow({ url: this.serverUrl, targetDir: this.targetDir || process.cwd(), sessionID: phase.sessionID })
+      .then((backend) => {
+        this.addEvent("archer", "system", `${name} session opened in ${backend}`)
+        this.render()
+      })
+      .catch((error: unknown) => {
+        this.addEvent("archer", "error", `couldn't open opencode session: ${error instanceof Error ? error.message : String(error)}`)
+        this.render()
+      })
     this.render()
   }
 
@@ -618,8 +814,7 @@ export class TuiProgress implements ProgressUI {
 
     this.headerText.content = this.headerContent(now, innerWidth)
     this.pipelineText.content = this.pipelineContent(now)
-    this.sessionText.content = this.sessionContent(active, now, rightWidth)
-    this.feedText.content = this.feedContent(now, rightWidth)
+    this.feedText.content = this.activityContent(active, now, rightWidth)
     this.footerText.content = this.footerContent(now, innerWidth)
     this.renderPermissionModal()
     this.renderer.requestRender()
@@ -680,9 +875,9 @@ export class TuiProgress implements ProgressUI {
   private pipelineContent(now: number) {
     const width = pipelineWidth - 4
     const out: StyledText[] = []
+    const rows: (string | undefined)[] = []
     for (const phase of this.phases) {
       const isActive = phase.status === "running"
-      const marker = isActive ? fg(theme.accent)("▎") : fg(theme.faint)(" ")
       const name =
         phase.status === "pending"
           ? fg(theme.dim)(phase.name)
@@ -691,19 +886,31 @@ export class TuiProgress implements ProgressUI {
             : isActive
               ? bold(fg(theme.text)(phase.name))
               : fg(theme.text)(phase.name)
-      const left: TextChunk[] = [marker, raw(" "), statusIcon(phase.status, now), raw(" "), name]
+      const left: TextChunk[] = [statusIcon(phase.status, now), raw(" "), name]
+      rows.push(phase.name)
       out.push(padBetween(left, phaseMetaChunks(phase, now), width))
       if (isActive && phase.detail) {
-        out.push(t`    ${fg(theme.faint)(truncate(phase.detail, width - 5))}`)
+        rows.push(phase.name)
+        out.push(t`  ${fg(theme.faint)(truncate(phase.detail, width - 3))}`)
       }
     }
+    this.pipelineRowPhases = rows
     return joinLines(out)
   }
 
-  private sessionContent(active: PhaseState | undefined, now: number, width: number) {
-    if (!active) {
-      return joinLines([plain(""), t`${fg(theme.dim)("waiting for the first phase to start…")}`])
-    }
+  // The activity panel opens with a compact summary of the active phase (what
+  // the dedicated "current phase" panel used to show), then the event feed.
+  private activityContent(active: PhaseState | undefined, now: number, width: number) {
+    const summary = this.activeSummary(active, now, width)
+    // Fixed rows around the feed: header (4) + footer (3) + panel borders (2)
+    // + the separator line below the summary.
+    const visible = Math.max(4, this.renderer.height - 10 - summary.length)
+    const separator = t`${fg(theme.faint)("─".repeat(Math.max(1, width)))}`
+    return joinLines([...summary, separator, ...this.feedLines(width, visible)])
+  }
+
+  private activeSummary(active: PhaseState | undefined, now: number, width: number): StyledText[] {
+    if (!active) return [t`${fg(theme.dim)("waiting for the first phase to start…")}`]
 
     const out: StyledText[] = []
     const head: TextChunk[] =
@@ -714,15 +921,13 @@ export class TuiProgress implements ProgressUI {
       head.push(fg(theme.faint)("  ·  "), fg(theme.dim)(truncate(active.detail, Math.max(10, width - active.name.length - 8))))
     }
     out.push(new StyledText(head))
-    out.push(plain(""))
 
-    const style = kindStyle[active.now.kind]
+    const style = kindStyle(active.now.kind)
     out.push(
       active.now.message
         ? new StyledText([fg(style.color)(`${style.icon} `), fg(theme.text)(truncate(active.now.message, width - 4))])
         : t`${fg(theme.dim)("waiting for opencode events…")}`,
     )
-    out.push(plain(""))
 
     if (active.todos.length > 0) out.push(todoLine(active.todos, width))
     if (active.diff && active.diff.files > 0) {
@@ -746,32 +951,29 @@ export class TuiProgress implements ProgressUI {
       stats.push(fg(quiet > 60_000 ? theme.yellow : theme.faint)(` · quiet ${Math.floor(quiet / 1000)}s`))
     }
     out.push(new StyledText(stats))
-    return joinLines(out)
+    return out
   }
 
-  private feedContent(now: number, width: number) {
-    const visible = Math.max(4, this.renderer.height - 21)
+  private feedLines(width: number, visible: number): StyledText[] {
     const events = this.feed.slice(-visible).reverse()
-    if (events.length === 0) return t`${fg(theme.dim)("no activity yet…")}`
+    if (events.length === 0) return [t`${fg(theme.dim)("no activity yet…")}`]
 
-    return joinLines(
-      events.map((entry, index) => {
-        const style = kindStyle[entry.kind]
-        // Newest-first list: blank the phase label when the older neighbour
-        // repeats it, so each phase shows once at the start of its group.
-        const older = events[index + 1]
-        const phaseLabel = older && older.phase === entry.phase ? raw(" ".repeat(12)) : fg(theme.dim)(entry.phase.padEnd(12).slice(0, 12))
-        return new StyledText([
-          fg(theme.faint)(formatTime(entry.time)),
-          raw(" "),
-          fg(style.color)(style.icon),
-          raw(" "),
-          phaseLabel,
-          raw(" "),
-          fg(entry.kind === "error" ? theme.red : theme.text)(truncate(entry.message, Math.max(20, width - 26))),
-        ])
-      }),
-    )
+    return events.map((entry, index) => {
+      const style = kindStyle(entry.kind)
+      // Newest-first list: blank the phase label when the older neighbour
+      // repeats it, so each phase shows once at the start of its group.
+      const older = events[index + 1]
+      const phaseLabel = older && older.phase === entry.phase ? raw(" ".repeat(12)) : fg(theme.dim)(entry.phase.padEnd(12).slice(0, 12))
+      return new StyledText([
+        fg(theme.faint)(formatTime(entry.time)),
+        raw(" "),
+        fg(style.color)(style.icon),
+        raw(" "),
+        phaseLabel,
+        raw(" "),
+        fg(entry.kind === "error" ? theme.red : theme.text)(truncate(entry.message, Math.max(20, width - 26))),
+      ])
+    })
   }
 
   private footerContent(now: number, width: number) {
@@ -788,7 +990,9 @@ export class TuiProgress implements ProgressUI {
         fg(theme.accent)("r"),
         fg(theme.dim)("eject · "),
         fg(theme.accent)("esc"),
-        fg(theme.dim)(" rejects"),
+        fg(theme.dim)(" rejects · "),
+        fg(theme.accent)("shift+tab"),
+        fg(theme.dim)(" auto-accept"),
       ]
       const right: TextChunk[] = this.permissionQueue.length > 1 ? [fg(theme.yellow)(`${this.permissionQueue.length} pending`)] : []
       return padBetween(left, right, width)
@@ -801,6 +1005,10 @@ export class TuiProgress implements ProgressUI {
       fg(theme.yellow)("ctrl+c"),
       fg(theme.dim)(" abort"),
     ]
+    if (this.autoAccept) {
+      left.push(fg(theme.dim)(" · "), fg(theme.accent)("shift+tab"))
+      left.push(this.autoAccept.enabled ? bold(fg(theme.yellow)(" auto-accept ON")) : fg(theme.dim)(" auto-accept off"))
+    }
     const quiet = now - this.lastActivityAt
     const right: TextChunk[] = [
       fg(theme.faint)(this.runID ? `run ${this.runID}` : "run …"),
@@ -839,7 +1047,7 @@ export class TuiProgress implements ProgressUI {
     permissionChoices.forEach((choice, index) => {
       if (index > 0) buttons.push(raw("   "))
       const label = ` ${choice.label} `
-      buttons.push(index === this.permissionChoice ? bold(bg(choice.color)(fg(theme.bg)(label))) : fg(theme.dim)(label))
+      buttons.push(index === this.permissionChoice ? bold(bg(theme[choice.color])(fg(theme.chipText)(label))) : fg(theme.dim)(label))
     })
     lines.push(new StyledText(buttons))
 
@@ -873,7 +1081,31 @@ function padBetween(left: TextChunk[], right: TextChunk[], width: number): Style
 }
 
 function chunksLength(chunks: TextChunk[]) {
-  return chunks.reduce((sum, chunk) => sum + chunk.text.length, 0)
+  return chunks.reduce((sum, chunk) => sum + displayWidth(chunk.text), 0)
+}
+
+// East-Asian wide chars and emoji take two terminal cells; counting UTF-16
+// units would push the right-aligned columns out of the panel.
+function displayWidth(text: string) {
+  let width = 0
+  for (const char of text) {
+    width += isWideCodePoint(char.codePointAt(0)!) ? 2 : 1
+  }
+  return width
+}
+
+function isWideCodePoint(code: number) {
+  return (
+    (code >= 0x1100 && code <= 0x115f) ||
+    (code >= 0x2e80 && code <= 0xa4cf) ||
+    (code >= 0xac00 && code <= 0xd7a3) ||
+    (code >= 0xf900 && code <= 0xfaff) ||
+    (code >= 0xfe30 && code <= 0xfe4f) ||
+    (code >= 0xff00 && code <= 0xff60) ||
+    (code >= 0xffe0 && code <= 0xffe6) ||
+    (code >= 0x1f300 && code <= 0x1faff) ||
+    (code >= 0x20000 && code <= 0x3fffd)
+  )
 }
 
 function statusIcon(status: PhaseStatus, now: number): TextChunk {
@@ -893,10 +1125,11 @@ function statusIcon(status: PhaseStatus, now: number): TextChunk {
 
 function phaseMetaChunks(phase: PhaseState, now: number): TextChunk[] {
   if (phase.status === "pending") return []
-  if (phase.status === "skipped") return [fg(theme.faint)("skipped")]
+  if (phase.status === "skipped" && phase.restoredDurationMs === undefined) return [fg(theme.faint)("skipped")]
   const parts: TextChunk[] = []
-  if (phase.startedAt !== undefined) {
-    parts.push(fg(phase.status === "failed" ? theme.red : theme.dim)(formatElapsed((phase.endedAt ?? now) - phase.startedAt)))
+  const elapsed = phase.restoredDurationMs ?? (phase.startedAt !== undefined ? (phase.endedAt ?? now) - phase.startedAt : undefined)
+  if (elapsed !== undefined) {
+    parts.push(fg(phase.status === "failed" ? theme.red : theme.dim)(formatElapsed(elapsed)))
   }
   if (phase.usageReported) parts.push(fg(theme.faint)(` ${formatMoney(phase.cost)}`))
   return parts

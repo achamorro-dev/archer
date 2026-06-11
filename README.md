@@ -91,20 +91,32 @@ archer --prompt-file prd.md --app-run-command "pnpm dev"
 # optional Flutter emulator launch during manual review
 archer --prompt-file prd.md --emulator Pixel_8 --app-run-command "flutter run -d emulator-5554"
 
-# resume a failed run
+# resume a failed run (phases that already wrote their report are skipped,
+# and the dashboard restores their real duration, cost, and session)
 archer --resume 20260519-103045-x7q2
+
+# browse run history interactively: pick a run from the list (newest first,
+# with status, cost, and prompt), then [r]esume it, read its [s]ummary/reports,
+# or open a subshell in its run [d]ir under ~/.archer/runs (exit to return).
+# Pass a run ID to jump straight to that run's menu.
+archer runs
+archer runs 20260519-103045-x7q2
+
+# auto-allow ask-level permissions (the hard denylist still applies)
+archer --prompt-file prd.md --yolo
 
 # preserve run dir after completion
 archer --prompt-file prd.md --keep-run-dir
 
 # change the base branch used to calculate diffs between phases
+# (the ref is validated at startup; repos without a local main need this)
 archer --prompt-file prd.md --base develop
 
 # include existing local changes in the first commit of the pipeline
 archer --prompt-file prd.md --include-dirty --max-attempts 1
 ```
 
-In interactive terminals, Archer shows a full-screen OpenTUI dashboard: pipeline progress with per-phase duration and cost, the live state of the active session (current tool/thinking/writing, the agent's todo list, files changed, step count, tokens, cost), and a compact color-coded activity feed. Press `o`, or click the footer, to open the active OpenCode session in a new Terminal window attached to Archer's running OpenCode server. Press `Ctrl+C` once to abort the active OpenCode session and shut down Archer cleanly; press it again to force exit if cleanup hangs. Use `--no-tui` to fall back to plain logs.
+In interactive terminals, Archer shows a full-screen OpenTUI dashboard: pipeline progress with per-phase duration and cost, plus an activity panel headed by a compact summary of the active session (current tool/thinking/writing, the agent's todo list, files changed, step count, tokens, cost) above a color-coded event feed. The dashboard picks a dark or light palette from the terminal's reported background (with a neutral, background-free fallback when the terminal doesn't answer) and follows live theme changes. Press `o`, or click the footer, to open the active OpenCode session in a new terminal window attached to Archer's running OpenCode server — clicking any pipeline row opens that phase's session, including phases that already finished. Ghostty is preferred when installed; Terminal.app is the fallback (`ARCHER_TERMINAL=ghostty|terminal` forces a backend). Press `Shift+Tab` to toggle auto-accept (see the permission gate below). Press `Ctrl+C` once to abort the active OpenCode session and shut down Archer cleanly; press it again to force exit if cleanup hangs. The dashboard suspends for the whole `human-review` checkpoint — the prompts, your app command's output, and interactive OpenCode iterations own the terminal — and resumes when the gate finishes. Use `--no-tui` to fall back to plain logs.
 
 Phases run asynchronously: Archer fires the prompt with OpenCode's async API and detects completion through the event stream (`session.idle` / `session.error`), with a 30-second session-status poll as fallback and automatic event-stream reconnection. No HTTP request stays open for the duration of a phase, so long-running phases are immune to client-side socket timeouts. Archer also disables OpenCode's total provider request timeout for its default providers and keeps a 10-minute provider stream idle timeout instead.
 
@@ -123,6 +135,12 @@ approve? [o]nce, [a]lways, [r]eject >
 - `r` rejects the call (the agent receives a denial and decides what to do next).
 
 In non-interactive runs (no TTY), unknown commands are auto-rejected and logged. Tighten the policy further or expand the allowlist in `src/agents.ts` (`bashPolicy`).
+
+Archer also allowlists the target repo's own `package.json` scripts whose names look like checks (`test`, `lint`, `typecheck`, `type-check`, `check`, `build`, `format`, `validate`, including suffixed forms like `test:unit`), excluding anything whose name suggests side effects (`deploy`, `publish`, `release`, `migrate`, `seed`, `reset`). Note the trust model: agents can edit the repo, including script bodies, so allowlisted scripts mean trusting the repo's contents — the denylist protects against accidents, it is not a security boundary against a malicious agent.
+
+### Auto-accept (`--yolo` / `Shift+Tab`)
+
+`--yolo` starts the run with auto-accept enabled: every permission request that would normally *ask* is allowed automatically (replied as "once") and logged to the activity feed. In the dashboard, `Shift+Tab` toggles auto-accept at any time — enabling it also resolves any prompts already queued. The footer always shows the current state. The hard denylist is enforced by OpenCode itself and is never relaxed: denied commands are rejected before they ever reach the gate, with or without `--yolo`.
 
 ## Commit safety
 
@@ -170,6 +188,7 @@ Each invocation creates `~/.archer/runs/<run-id>/`:
 ```
 ~/.archer/runs/20260519-103045-x7q2/
 ├── prd.md
+├── metadata.json
 ├── reports/
 │   ├── implementer.md
 │   ├── human-review.md
@@ -189,6 +208,8 @@ Each invocation creates `~/.archer/runs/<run-id>/`:
 │   └── ...
 └── SUMMARY.md
 ```
+
+`metadata.json` records each phase's status, session ID, timing, cost, tokens, and model as the run progresses (written atomically, debounced). On `--resume`, phases that already wrote their report are restored in the dashboard with their real duration, cost, and session — and their session can still be opened by clicking the pipeline row.
 
 The run dir is deleted on successful completion unless `--keep-run-dir`. If it fails, it's preserved for inspecting reports, diffs, and logs.
 
@@ -218,6 +239,8 @@ archer/
 │   ├── attachments.ts   # FilePartInput for --file and internal attachments
 │   ├── git.ts           # diff, commit, and pre-commit secret scan
 │   ├── workspace.ts     # run dir
+│   ├── runs.ts          # interactive run-history browser (archer runs)
+│   ├── metadata.ts      # per-run metadata.json for --resume restore
 │   └── phases.ts        # declarative phase definition
 ├── prompts/             # built-in agent prompts and runtime safety guard rails
 ├── test/                # unit tests for CLI/orchestration
