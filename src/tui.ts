@@ -154,10 +154,13 @@ export class TuiProgress implements ProgressUI {
   private readonly phases: PhaseState[]
   private readonly feed: FeedEntry[] = []
   private readonly ticker: ReturnType<typeof setInterval>
+  private readonly dirText: TextRenderable
   private readonly headerText: TextRenderable
   private readonly pipelineText: TextRenderable
   private readonly stepBox: BoxRenderable
   private readonly stepText: TextRenderable
+  private readonly todosBox: BoxRenderable
+  private readonly todosText: TextRenderable
   private readonly feedText: TextRenderable
   private readonly footerText: TextRenderable
   // Rebuilt on every pipeline render: panel row index → phase name, so clicks
@@ -243,9 +246,19 @@ export class TuiProgress implements ProgressUI {
       gap: 0,
     })
 
+    // The working directory sits above the header as a bare line, outside the
+    // bordered box, so the header itself stays a single clean row of totals.
+    const dirLine = new TextRenderable(renderer, {
+      id: "archer-dir",
+      content: "",
+      fg: theme.text,
+      width: "100%",
+      height: 1,
+    })
+
     const header = this.panel({
       id: "archer-header",
-      height: 4,
+      height: 3,
       borderColor: theme.border,
       backgroundColor: theme.bg,
     })
@@ -303,6 +316,21 @@ export class TuiProgress implements ProgressUI {
     })
     step.text.onMouseDown = openFromStep
 
+    // Todos live in their own panel below the step meta; its border is the
+    // divider between session usage above and the todo list itself.
+    const todos = this.panel({
+      id: "archer-todos",
+      width: "100%",
+      height: 3,
+      borderColor: theme.borderDim,
+      backgroundColor: theme.bg,
+      title: " todos ",
+      titleAlignment: "left",
+      visible: false,
+      onMouseDown: openFromStep,
+    })
+    todos.text.onMouseDown = openFromStep
+
     const feed = this.panel({
       id: "archer-feed",
       width: "100%",
@@ -328,10 +356,13 @@ export class TuiProgress implements ProgressUI {
     })
     footer.text.onMouseDown = openFromFooter
 
+    this.dirText = dirLine
     this.headerText = header.text
     this.pipelineText = pipeline.text
     this.stepBox = step.box
     this.stepText = step.text
+    this.todosBox = todos.box
+    this.todosText = todos.text
     this.feedText = feed.text
     this.footerText = footer.text
 
@@ -340,14 +371,17 @@ export class TuiProgress implements ProgressUI {
       { box: header.box, background: "bg", border: "border" },
       { box: pipeline.box, background: "bg", border: "borderDim" },
       { box: step.box, background: "bg", border: "borderDim" },
+      { box: todos.box, background: "bg", border: "borderDim" },
       { box: feed.box, background: "bg", border: "borderDim" },
       { box: footer.box, background: "bg", border: "borderDim" },
     )
 
     body.add(pipeline.box)
     right.add(step.box)
+    right.add(todos.box)
     right.add(feed.box)
     body.add(right)
+    shell.add(dirLine)
     shell.add(header.box)
     shell.add(body)
     shell.add(footer.box)
@@ -783,35 +817,54 @@ export class TuiProgress implements ProgressUI {
     const innerWidth = Math.max(40, this.renderer.width - 6)
     const rightWidth = Math.max(40, this.renderer.width - pipelineWidth - 9)
 
-    // Body rows left after the header (4) and footer (3); the step panel grows
-    // with its content (todos) but never starves the logs below it.
+    // Body rows left after the dir line (1), header (3), and footer (3); the
+    // step and todos panels grow with their content but never starve the logs.
     const bodyHeight = Math.max(8, this.renderer.height - 7)
-    const stepLines = this.stepContent(active, now, rightWidth, Math.max(8, Math.floor(bodyHeight * 0.6) - 2))
+    const stepLines = this.stepContent(active, now, rightWidth)
     this.stepBox.height = stepLines.length + 2
 
+    const todoRows =
+      active && active.todos.length > 0
+        ? todoLines(active.todos, Math.max(3, Math.floor(bodyHeight * 0.6) - stepLines.length - 4), rightWidth)
+        : []
+    this.todosBox.visible = todoRows.length > 0
+    if (active && todoRows.length > 0) {
+      const completed = active.todos.filter((todo) => todo.status === "completed").length
+      this.todosBox.height = todoRows.length + 2
+      this.todosBox.title = ` todos ${completed}/${active.todos.length} `
+      this.todosText.content = joinLines(todoRows)
+    }
+    const todosHeight = this.todosBox.visible ? todoRows.length + 2 : 0
+
+    this.dirText.content = this.dirContent(innerWidth)
     this.headerText.content = this.headerContent(now, innerWidth)
     this.pipelineText.content = this.pipelineContent(now)
     this.stepText.content = joinLines(stepLines)
-    this.feedText.content = joinLines(this.feedLines(rightWidth, Math.max(3, bodyHeight - stepLines.length - 4)))
+    this.feedText.content = joinLines(this.feedLines(rightWidth, Math.max(3, bodyHeight - stepLines.length - todosHeight - 4)))
     this.footerText.content = this.footerContent(now, innerWidth)
     this.renderPermissionModal()
     this.renderer.requestRender()
   }
 
-  // Header owns the session-wide identity and totals: working directory,
-  // elapsed time, cost, and tokens. Phase status lives in the pipeline panel.
+  // Header owns the session-wide totals in a single row: clock, elapsed time,
+  // cost, and tokens. Phase status lives in the pipeline panel.
   private headerContent(now: number, width: number) {
     const usage = totalUsage(this.phases)
     const totals: TextChunk[] = [
+      fg(theme.dim)(formatTime(now)),
+      fg(theme.faint)("  ·  "),
       fg(theme.text)(formatElapsed(now - this.startedAt)),
       fg(theme.faint)("  ·  "),
       fg(theme.green)(formatMoney(usage.cost)),
       fg(theme.faint)("  ·  "),
       fg(theme.dim)(`↑${formatCount(usage.tokens.input)} ↓${formatCount(usage.tokens.output)} tokens`),
     ]
-    const line1 = padBetween([bold(fg(theme.accent)("◆ archer"))], totals, width)
-    const line2 = t`${fg(theme.dim)("dir ")}${fg(theme.text)(shortPath(this.targetDir, width - 4))}`
-    return joinLines([line1, line2])
+    return padBetween([bold(fg(theme.accent)("◆ archer"))], totals, width)
+  }
+
+  // The working directory renders above the header box, outside its border.
+  private dirContent(width: number) {
+    return t`${fg(theme.dim)("dir ")}${fg(theme.text)(shortPath(this.targetDir, width - 4))}`
   }
 
   private overallFraction() {
@@ -860,8 +913,9 @@ export class TuiProgress implements ProgressUI {
   }
 
   // The current-step panel owns everything about the phase in flight: live
-  // activity, model, attempt, session usage, diff, and the expanded todo list.
-  private stepContent(active: PhaseState | undefined, now: number, width: number, maxRows: number): StyledText[] {
+  // activity, model, attempt, session usage, and diff. Todos render in their
+  // own panel below this one.
+  private stepContent(active: PhaseState | undefined, now: number, width: number): StyledText[] {
     if (!active) return [t`${fg(theme.dim)("waiting for the first phase to start…")}`]
 
     const out: StyledText[] = []
@@ -869,18 +923,23 @@ export class TuiProgress implements ProgressUI {
       active.status === "running"
         ? [fg(theme.accent)(`${spinnerFrame(now)} `), bold(fg(theme.text)(active.name))]
         : [statusIcon(active.status, now), raw(" "), bold(fg(theme.text)(active.name))]
+    // Live activity sits to the right of the name; truncation reserves room
+    // for the name, the separators, and a possible quiet indicator.
+    if (active.now.message) {
+      const style = kindStyle(active.now.kind)
+      head.push(
+        fg(theme.faint)("  ·  "),
+        fg(style.color)(`${style.icon} `),
+        fg(theme.text)(truncate(active.now.message, Math.max(10, width - active.name.length - 28))),
+      )
+    } else {
+      head.push(fg(theme.faint)("  ·  "), fg(theme.dim)("waiting for opencode events…"))
+    }
     const quiet = now - active.updatedAt
     if (quiet > 10_000 && active.status === "running") {
       head.push(fg(quiet > 60_000 ? theme.yellow : theme.faint)(`  ·  quiet ${Math.floor(quiet / 1000)}s`))
     }
     out.push(new StyledText(head))
-
-    const style = kindStyle(active.now.kind)
-    out.push(
-      active.now.message
-        ? new StyledText([fg(style.color)(`${style.icon} `), fg(theme.text)(truncate(active.now.message, width - 4))])
-        : t`${fg(theme.dim)("waiting for opencode events…")}`,
-    )
 
     const meta: TextChunk[] = []
     const model = active.lastStepModel || active.model
@@ -910,18 +969,6 @@ export class TuiProgress implements ProgressUI {
       out.push(
         t`${fg(theme.dim)("changes ")}${fg(theme.text)(`${active.diff.files} files`)} ${fg(theme.green)(`+${active.diff.additions}`)} ${fg(theme.red)(`−${active.diff.deletions}`)}`,
       )
-    }
-
-    if (active.todos.length > 0) {
-      const completed = active.todos.filter((todo) => todo.status === "completed").length
-      out.push(
-        new StyledText([
-          fg(theme.faint)("todos "),
-          ...progressBar(completed / active.todos.length, 10, theme.teal),
-          fg(theme.text)(` ${completed}/${active.todos.length}`),
-        ]),
-      )
-      out.push(...todoLines(active.todos, Math.max(3, maxRows - out.length), width))
     }
     return out
   }
@@ -1065,7 +1112,7 @@ function todoRow(todo: ProgressTodo, width: number): StyledText {
     case "completed":
       return new StyledText([fg(theme.green)("  ✓ "), fg(theme.dim)(text)])
     case "in_progress":
-      return new StyledText([fg(theme.accent)("  ▸ "), bold(fg(theme.text)(text))])
+      return new StyledText([fg(theme.accent)("  ● "), bold(fg(theme.text)(text))])
     case "cancelled":
       return new StyledText([fg(theme.faint)("  ⊘ "), fg(theme.faint)(text)])
     default:

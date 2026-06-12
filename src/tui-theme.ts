@@ -228,17 +228,17 @@ function isWideCodePoint(code: number) {
   )
 }
 
-// Box-drawing strokes render single-width everywhere, unlike the geometric
-// shapes (▰▱) that draw unevenly in many terminal fonts.
+// Block elements render single-width in every terminal font, and the
+// full-cell blocks read as one solid strip instead of a thin stroke.
 export function progressBar(fraction: number, width: number, color: string): TextChunk[] {
   const cells = Math.max(0, Math.min(1, fraction)) * width
   const filled = Math.floor(cells)
   const head = filled < width && cells - filled >= 0.5
   const track = width - filled - (head ? 1 : 0)
   const chunks: TextChunk[] = []
-  if (filled > 0) chunks.push(fg(color)("━".repeat(filled)))
-  if (head) chunks.push(fg(color)("╸"))
-  if (track > 0) chunks.push(fg(theme.faint)("─".repeat(track)))
+  if (filled > 0) chunks.push(fg(color)("█".repeat(filled)))
+  if (head) chunks.push(fg(color)("▌"))
+  if (track > 0) chunks.push(fg(theme.faint)("░".repeat(track)))
   return chunks
 }
 
