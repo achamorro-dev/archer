@@ -1,27 +1,29 @@
 # archer
 
-Sequential [OpenCode](https://opencode.ai) agent pipeline for implementing features on software repos. It works with Flutter, web, backend, CLI, and mixed projects by detecting the repo's existing stack and conventions. Takes a PRD, runs agents in chain, and leaves one commit per phase.
+Sequential [OpenCode](https://opencode.ai) agent pipeline for implementing features on software repos. It works with Flutter, web, backend, CLI, and mixed projects by detecting the repo's existing stack and conventions. Takes a PRD, runs agents in chain, and leaves one commit per step.
+
+Pipelines are data, not code: archer ships a built-in `default` pipeline, and a project can define its own — any number of steps, its own agents, its own models, with `human-review` gates anywhere — in `.archer/config.yaml`.
 
 Archer is written in Bun + TypeScript and uses `@opencode-ai/sdk` to control OpenCode. The SDK starts/controls the OpenCode server; Archer no longer manually calls `opencode run` nor parses stdout.
 
-## The Pipeline
+## The default pipeline
 
 ```
-PRD ──► implementer ──► human-review ──► pattern-auditor ──► security-auditor ──► design-polisher ──► test-engineer ──► adversarial-reviewer
-         │                                │                    │                    │                  │                │
-         └────────────────────────────────┴────────────────────┴────────────────────┴──────────────────┴────────────────┘
-                                                              commit per phase
+PRD ──► implementer ──► human-review ──► patterns ──► security ──► design ──► tests ──► adversarial
+         │                                │            │            │          │         │
+         └────────────────────────────────┴────────────┴────────────┴──────────┴─────────┘
+                                                              commit per step
 ```
 
-| Phase | Model | What it does |
-|---|---|---|
-| `implementer` | `openai/gpt-5.5#xhigh` | Implements the feature respecting repo patterns |
-| `human-review` | interactive checkpoint | Runs the app, waits for approval, or hands control to OpenCode for manual iteration |
-| `patterns` | `openai/gpt-5.5#xhigh` | Refactors without changing behavior, aligns with the rest of the code |
-| `security` | `openai/gpt-5.5#xhigh` | Audits and fixes security issues |
-| `design` | `anthropic/claude-opus-4-7` | Polishes UI following the repo's design system |
-| `tests` | `openai/gpt-5.5#xhigh` | Automated tests + relevant E2E/integration coverage |
-| `adversarial` | `anthropic/claude-opus-4-7` | Final adversarial review before PR creation |
+| Step | Agent | Model | What it does |
+|---|---|---|---|
+| `implementer` | `implementer` | `openai/gpt-5.5#xhigh` | Implements the feature respecting repo patterns |
+| `human-review` | — | interactive checkpoint | Runs the app, waits for approval, or hands control to OpenCode for manual iteration |
+| `patterns` | `pattern-auditor` | `openai/gpt-5.5#xhigh` | Refactors without changing behavior, aligns with the rest of the code |
+| `security` | `security-auditor` | `openai/gpt-5.5#xhigh` | Audits and fixes security issues |
+| `design` | `design-polisher` | `anthropic/claude-opus-4-7` | Polishes UI following the repo's design system |
+| `tests` | `test-engineer` | `openai/gpt-5.5#xhigh` | Automated tests + relevant E2E/integration coverage |
+| `adversarial` | `adversarial-reviewer` | `anthropic/claude-opus-4-7` | Final adversarial review before PR creation |
 
 ## Requirements
 
@@ -70,13 +72,16 @@ archer --prompt-file prd.md
 # attach files or directories to all phases
 archer --prompt-file prd.md --file src/features/onboarding --file tests/onboarding.test.ts
 
-# only one phase
+# run a project-defined pipeline (see "Project configuration" below)
+archer --prompt-file bug.md --pipeline bug-fix
+
+# only one step
 archer --prompt-file prd.md --only implementer
 
-# skip phases
+# skip steps
 archer --prompt-file prd.md --skip security,design
 
-# force a different model for all phases
+# force a different model for all steps
 archer --prompt-file prd.md --model anthropic/claude-sonnet-4-6
 
 # disable the OpenTUI progress footer
@@ -103,6 +108,11 @@ archer --resume 20260519-103045-x7q2
 # Without a TTY (pipes/CI) it falls back to a plain listing.
 archer runs
 archer runs 20260519-103045-x7q2
+
+# view and edit the global (~/.archer) and current project config in a TUI:
+# two tabs (Global / Project), pick models with autocomplete, edit pipelines
+# and steps, or initialize a starter config when none exists.
+archer config
 
 # auto-allow ask-level permissions (the hard denylist still applies)
 archer --prompt-file prd.md --yolo
@@ -138,7 +148,7 @@ approve? [o]nce, [a]lways, [r]eject >
 - `a` allows future calls matching the same pattern for the rest of the run.
 - `r` rejects the call (the agent receives a denial and decides what to do next).
 
-In non-interactive runs (no TTY), unknown commands are auto-rejected and logged. Tighten the policy further or expand the allowlist in `src/agents.ts` (`bashPolicy`).
+In non-interactive runs (no TTY), unknown commands are auto-rejected and logged. Per-project, extend the lists with `permissions.allow`/`permissions.deny` in `.archer/config.yaml`; the global policy lives in `src/agents.ts` (`bashPolicy`).
 
 Archer also allowlists the target repo's own `package.json` scripts whose names look like checks (`test`, `lint`, `typecheck`, `type-check`, `check`, `build`, `format`, `validate`, including suffixed forms like `test:unit`), excluding anything whose name suggests side effects (`deploy`, `publish`, `release`, `migrate`, `seed`, `reset`). Note the trust model: agents can edit the repo, including script bodies, so allowlisted scripts mean trusting the repo's contents — the denylist protects against accidents, it is not a security boundary against a malicious agent.
 
@@ -151,6 +161,86 @@ Archer also allowlists the target repo's own `package.json` scripts whose names 
 Before each commit Archer scans the staged files for common secret names (`.env*`, `*.pem`, `*.key`, `id_rsa*`, `credentials*`, `*.p12`, `*.keystore`, ...). If any match, the commit is aborted, the index reset, and Archer asks you to add them to `.gitignore` (or delete them) before re-running. Combined with `--include-dirty` this is the only line of defense against accidentally publishing a secret your working tree had lying around — review the resulting commits with `git show` before pushing.
 
 During `human-review`, Archer waits 10 seconds for an explicit action. If nobody answers, it prepares the configured app command in the target worktree. By default the app command is disabled; pass `--app-run-command "pnpm dev"`, `--app-run-command "flutter run"`, or the repo's equivalent. Archer only launches a Flutter emulator when `--emulator <id>` is explicitly provided.
+
+## Project configuration (`.archer/config.yaml`)
+
+A project can reshape archer entirely from one file. Everything is optional — the file only declares what differs from the defaults. The same schema also lives globally at `~/.archer/config.yaml` (see [Global configuration](#global-configuration)); the project file is merged on top of it.
+
+```yaml
+version: 1
+
+defaults:
+  model: openai/gpt-5.5#xhigh     # provider/model[#variant], used by steps with no model of their own
+  maxAttempts: 2
+  baseRef: main
+  pipeline: quick                  # pipeline used when -p/--pipeline is not given
+  appRunCommand: pnpm dev          # app command for human-review gates
+  emulator: Pixel_8                # optional Flutter emulator for human-review gates
+  interactiveModel: openai/gpt-5.5#xhigh
+
+# Project agents: the prompt lives at .archer/agents/<name>.md (required).
+# Naming a built-in agent here overrides its model/temperature instead.
+agents:
+  api-reviewer:
+    description: Reviews public API consistency
+    model: anthropic/claude-opus-4-7
+    temperature: 0.1
+
+pipelines:
+  quick:
+    description: Implementation, manual gate, tests
+    steps:
+      - implementer                # string = agent (or alias) with that step name
+      - human-review               # reserved keyword: manual review gate, placeable anywhere, repeatable
+      - agent: tests
+        maxAttempts: 3
+  api:
+    steps:
+      - implementer
+      - api-reviewer               # project agent defined above
+      - human-review
+      - agent: security
+        reports: all               # attach every previous step report (default: the nearest one)
+      - agent: adversarial
+        name: final-check          # step name (report file, commit prefix, --only/--skip)
+        reports: [implementer, security]
+
+permissions:                       # additive only; a config allow can never undo a deny
+  allow:
+    - "supabase gen types*"
+  deny:
+    - "stripe *"
+
+attachments:                       # attached to every step, like repeatable --file flags
+  - docs/architecture.md
+```
+
+The rules:
+
+- **Precedence**: CLI flag > project config > global config > built-in default. Within a config, for models specifically: step `model` > agent `model` > `defaults.model` > the agent's built-in preference (opus for design/adversarial) > `openai/gpt-5.5#xhigh`. `--model` overrides everything.
+- **Conventions over wiring**: every agent step gets the PRD, the cumulative diff against the base branch (except the first step; opt out with `diff: false`), and the previous step's report (`reports: previous|all|none|[names]`). Its report lands at `reports/<step>.md` and its commit is `archer(<step>): …`.
+- **Aliases**: the built-in agents answer to their short names in steps — `patterns`, `security`, `design`, `tests`, `adversarial` — as well as their full names.
+- **Project pipelines shadow built-ins**: defining `pipelines.default` replaces the built-in default.
+- **`--no-human-review`** (and non-TTY runs) drop every `human-review` gate from the pipeline.
+- **Resume is frozen**: the resolved pipeline is persisted in the run's `metadata.json`; `--resume` replays it even if the config changed since.
+- **Permissions are additive**: `permissions.deny` extends the hard denylist, `permissions.allow` extends the allowlist, deny always wins, and there is deliberately no way for a repo to grant itself `--yolo`.
+
+## Global configuration
+
+`~/.archer/config.yaml` uses the exact same schema as the project file and sets your personal defaults across every repo — most usefully `defaults.model`, but also custom agents and pipelines. Global custom agents bring their prompt at `~/.archer/agents/<name>.md` (the same convention a project uses, relative to your home).
+
+Both files are merged before a run, with the project winning: `defaults`, `agents`, and `pipelines` merge by key/name (a project entry overrides the global one of the same name), while `permissions` and `attachments` concatenate (global first; `deny` still wins). The home directory archer reads can be relocated with `ARCHER_HOME` (it points at the directory that holds `.archer`, and also moves `~/.archer/runs`).
+
+## Editing config interactively (`archer config`)
+
+`archer config` opens a TUI to view and edit both configs without hand-editing YAML — two tabs, **Global** (`~/.archer/config.yaml`) and **Project** (the current repo's `.archer/config.yaml`):
+
+- Pick models from an autocompleting list: it queries OpenCode for the models your enabled providers expose (including reasoning variants like `#xhigh`), falling back to the full [models.dev](https://models.dev) catalog when OpenCode can't answer, and always accepts a free-typed `provider/model[#variant]`.
+- Edit `defaults` (model, interactiveModel, maxAttempts, baseRef, pipeline, app command, emulator) and each agent's model/temperature override.
+- Browse pipelines and their steps; add, delete, reorder steps, set a per-step model or max-attempts, and add new pipelines. Permissions and attachments are shown read-only (edit those in the YAML).
+- When a tab has no file yet, `initialize` writes a starter config (the built-in `default` pipeline, expanded and ready to edit).
+
+Keys: `↑/↓` move, `enter` edit/expand, `tab` switch tab, `a` add, `d` delete a step, `shift+↑/↓` reorder a step, `t` agent temperature, `m` step max-attempts, `s` save the active tab, `q` quit. Saving re-validates and rewrites clean YAML (comments are not preserved); the dashboard never paints backgrounds, like the run TUIs. Needs an interactive terminal.
 
 ## Project Context And Custom Agents
 
@@ -168,16 +258,14 @@ Built-in agent prompts live as Markdown files under `prompts/`. A project can fu
 
 ```text
 .archer/
+├── config.yaml          # defaults, agents, pipelines, permissions, attachments
 └── agents/
-    ├── implementer.md
+    ├── implementer.md   # overrides the built-in implementer prompt
     ├── pattern-auditor.md
-    ├── security-auditor.md
-    ├── design-polisher.md
-    ├── test-engineer.md
-    └── adversarial-reviewer.md
+    └── api-reviewer.md  # prompt for a project agent declared in config.yaml
 ```
 
-When a project override exists, it replaces that agent's built-in prompt completely. Archer still appends its non-replaceable runtime safety guard rails from `prompts/runtime-safety.md`.
+When a project override exists, it replaces that agent's built-in prompt completely. Project agents declared in `config.yaml` must bring their prompt at `.archer/agents/<name>.md` (validated at startup). In both cases Archer still appends its non-replaceable runtime safety guard rails from `prompts/runtime-safety.md`.
 
 ## Efficient Attachments
 
@@ -213,7 +301,7 @@ Each invocation creates `~/.archer/runs/<run-id>/`:
 └── SUMMARY.md
 ```
 
-`metadata.json` records each phase's status, session ID, timing, cost, tokens, and model as the run progresses (written atomically, debounced). On `--resume`, phases that already wrote their report are restored in the dashboard with their real duration, cost, and session — and their session can still be opened by clicking the pipeline row.
+`metadata.json` records the resolved pipeline the run executes plus each step's status, session ID, timing, cost, tokens, and model as the run progresses (written atomically, debounced). On `--resume`, the frozen pipeline is replayed — even if `.archer/config.yaml` changed since — and steps that already wrote their report are restored in the dashboard with their real duration, cost, and session, which can still be opened by clicking the pipeline row.
 
 The run dir is deleted on successful completion unless `--keep-run-dir`. If it fails, it's preserved for inspecting reports, diffs, and logs.
 
@@ -242,10 +330,14 @@ archer/
 │   ├── permissions.ts   # live permission gate for tool calls that fall outside the allowlist
 │   ├── attachments.ts   # FilePartInput for --file and internal attachments
 │   ├── git.ts           # diff, commit, and pre-commit secret scan
-│   ├── workspace.ts     # run dir
+│   ├── workspace.ts     # run dir, ~/.archer home (ARCHER_HOME), global config/agents paths
 │   ├── runs.ts          # interactive run-history browser (archer runs)
-│   ├── metadata.ts      # per-run metadata.json for --resume restore
-│   └── phases.ts        # declarative phase definition
+│   ├── runs-tui.ts      # OpenTUI run-history browser rendering
+│   ├── metadata.ts      # per-run metadata.json: frozen pipeline + --resume restore
+│   ├── config.ts        # config loader/validation, global+project merge, YAML writer
+│   ├── config-tui.ts    # interactive config editor (archer config)
+│   ├── model-catalog.ts # available-model list via OpenCode SDK, models.dev fallback
+│   └── pipeline.ts      # built-in agents/pipeline and pipeline-spec resolution
 ├── prompts/             # built-in agent prompts and runtime safety guard rails
 ├── test/                # unit tests for CLI/orchestration
 ├── package.json

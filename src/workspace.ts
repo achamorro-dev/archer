@@ -58,7 +58,32 @@ export function runDir(runID: string) {
 }
 
 export function runsRoot() {
-  return join(homedir(), ".archer", "runs")
+  return join(archerHome(), "runs")
+}
+
+/**
+ * The directory that contains archer's `.archer` home — the user's home by
+ * default, relocatable via ARCHER_HOME. It plays the same role for the global
+ * config that a repo root plays for a project, so agent-prompt paths resolve
+ * the same way (`<root>/.archer/agents/<name>.md`).
+ */
+export function archerRoot() {
+  return process.env.ARCHER_HOME || homedir()
+}
+
+/** Archer's per-user home, holding run history and the global config. */
+export function archerHome() {
+  return join(archerRoot(), ".archer")
+}
+
+/** Path of the global config file (default name); the loader also accepts config.yml. */
+export function globalConfigPath() {
+  return join(archerHome(), "config.yaml")
+}
+
+/** Where prompts for global custom agents live, mirroring a project's .archer/agents. */
+export function globalAgentsDir() {
+  return join(archerHome(), "agents")
 }
 
 export function isValidRunID(runID: string) {
