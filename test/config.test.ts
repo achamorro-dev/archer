@@ -2,9 +2,22 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
-import { afterAll, describe, expect, test } from "bun:test"
+import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test"
 
-import { buildAgentRegistry, loadArcherConfig, parseArcherConfig, selectPipelineSpec, ConfigError } from "../src/config"
+import {
+  buildAgentRegistry,
+  ConfigError,
+  defaultConfigTemplate,
+  isValidModelString,
+  loadArcherConfig,
+  loadGlobalArcherConfig,
+  loadMergedArcherConfig,
+  mergeArcherConfigs,
+  parseArcherConfig,
+  selectPipelineSpec,
+  serializeArcherConfig,
+} from "../src/config"
+import { defaultGptModel, defaultGptVariant, defaultOpusModel } from "../src/pipeline"
 
 const dirs: string[] = []
 
@@ -161,5 +174,111 @@ describe("pipeline selection", () => {
     expect(selectPipelineSpec(undefined, "default").steps.length).toBeGreaterThan(1)
     expect(() => selectPipelineSpec(config, "ghost")).toThrow('unknown pipeline "ghost" (available: default, quick)')
     expect(() => selectPipelineSpec(config, "ghost")).toThrow(ConfigError)
+  })
+})
+
+describe("isValidModelString", () => {
+  test("accepts provider/model and provider/model#variant, rejects the rest", () => {
+    expect(isValidModelString("openai/gpt-5.5")).toBe(true)
+    expect(isValidModelString("openai/gpt-5.5#xhigh")).toBe(true)
+    expect(isValidModelString("anthropic/claude/opus")).toBe(true)
+    expect(isValidModelString("gpt-5.5")).toBe(false)
+    expect(isValidModelString("openai/")).toBe(false)
+    expect(isValidModelString("")).toBe(false)
+  })
+})
+
+describe("config merging", () => {
+  test("defaults merge shallow by key; project wins", () => {
+    const global = parse("defaults:\n  model: openai/gpt-5.5#xhigh\n  maxAttempts: 9")
+    const project = parse("defaults:\n  maxAttempts: 2\n  baseRef: dev")
+    expect(mergeArcherConfigs(global, project)?.defaults).toEqual({ model: "openai/gpt-5.5#xhigh", maxAttempts: 2, baseRef: "dev" })
+  })
+
+  test("agents and pipelines merge by name; project entry wins wholesale", () => {
+    const global = parse("agents:\n  design-polisher:\n    model: openai/gpt-5.5#xhigh\npipelines:\n  default:\n    steps:\n      - tests\n  shared:\n    steps:\n      - implementer")
+    const project = parse("agents:\n  design-polisher:\n    temperature: 0.2\npipelines:\n  default:\n    steps:\n      - implementer")
+    const merged = mergeArcherConfigs(global, project)!
+    expect(merged.agents["design-polisher"]).toEqual({ temperature: 0.2 })
+    expect(merged.pipelines.default?.steps).toEqual(["implementer"])
+    expect(merged.pipelines.shared?.steps).toEqual(["implementer"])
+  })
+
+  test("permissions and attachments concatenate, global first", () => {
+    const global = parse("permissions:\n  allow:\n    - 'a'\nattachments:\n  - 'g.md'")
+    const project = parse("permissions:\n  allow:\n    - 'b'\n  deny:\n    - 'x'\nattachments:\n  - 'p.md'")
+    const merged = mergeArcherConfigs(global, project)!
+    expect(merged.permissions).toEqual({ allow: ["a", "b"], deny: ["x"] })
+    expect(merged.attachments).toEqual(["g.md", "p.md"])
+  })
+
+  test("a missing side passes the other through unchanged", () => {
+    const only = parse("defaults:\n  model: openai/gpt-5.5")
+    expect(mergeArcherConfigs(undefined, undefined)).toBeUndefined()
+    expect(mergeArcherConfigs(only, undefined)).toBe(only)
+    expect(mergeArcherConfigs(undefined, only)).toBe(only)
+  })
+})
+
+describe("serialization", () => {
+  test("omits empty sections and round-trips through parse", () => {
+    const config = parse("defaults:\n  model: openai/gpt-5.5#xhigh\npipelines:\n  default:\n    steps:\n      - implementer\n      - human-review")
+    const yaml = serializeArcherConfig(config)
+    expect(yaml).toContain("version: 1")
+    expect(yaml).not.toContain("agents")
+    expect(yaml).not.toContain("permissions")
+    expect(yaml).not.toContain("attachments")
+    const reparsed = parse(yaml)
+    expect(reparsed.defaults).toEqual(config.defaults)
+    expect(reparsed.pipelines).toEqual(config.pipelines)
+  })
+
+  test("defaultConfigTemplate inlines opus on design and round-trips", () => {
+    const template = defaultConfigTemplate()
+    expect(template.defaults.model).toBe(`${defaultGptModel}#${defaultGptVariant}`)
+    const steps = template.pipelines.default!.steps
+    expect(steps.find((step) => typeof step !== "string" && step.agent === "design")).toEqual({ agent: "design", model: defaultOpusModel })
+    const reparsed = parse(serializeArcherConfig(template))
+    expect(reparsed.defaults).toEqual(template.defaults)
+    expect(reparsed.pipelines).toEqual(template.pipelines)
+  })
+})
+
+describe("global config", () => {
+  let savedHome: string | undefined
+  beforeEach(() => {
+    savedHome = process.env.ARCHER_HOME
+  })
+  afterEach(() => {
+    if (savedHome === undefined) delete process.env.ARCHER_HOME
+    else process.env.ARCHER_HOME = savedHome
+  })
+
+  // ARCHER_HOME points at the directory that contains .archer, like a repo root.
+  async function globalHome(): Promise<string> {
+    const root = await mkdtemp(join(tmpdir(), "archer-home-"))
+    dirs.push(root)
+    await mkdir(join(root, ".archer", "agents"), { recursive: true })
+    process.env.ARCHER_HOME = root
+    return join(root, ".archer")
+  }
+
+  test("loads ~/.archer/config.yaml and validates global agents against ~/.archer/agents", async () => {
+    const home = await globalHome()
+    await writeFile(join(home, "agents", "global-agent.md"), "# global-agent\n")
+    await writeFile(join(home, "config.yaml"), "defaults:\n  model: openai/gpt-5.5#xhigh\nagents:\n  global-agent:\n    description: A global agent\n    model: anthropic/claude-opus-4-7\n")
+
+    const config = await loadGlobalArcherConfig()
+    expect(config?.defaults.model).toBe("openai/gpt-5.5#xhigh")
+    expect(config?.agents["global-agent"]).toMatchObject({ model: "anthropic/claude-opus-4-7" })
+  })
+
+  test("merges global under project so the project wins", async () => {
+    const home = await globalHome()
+    await writeFile(join(home, "config.yaml"), "defaults:\n  model: openai/gpt-5.5#xhigh\n  maxAttempts: 9\n")
+
+    const project = await projectDir("defaults:\n  maxAttempts: 2\n")
+    const merged = await loadMergedArcherConfig(project)
+    expect(merged?.defaults).toEqual({ model: "openai/gpt-5.5#xhigh", maxAttempts: 2 })
   })
 })

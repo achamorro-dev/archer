@@ -1,11 +1,22 @@
 import { statSync } from "node:fs"
-import { readFile } from "node:fs/promises"
-import { join } from "node:path"
+import { mkdir, readFile, writeFile } from "node:fs/promises"
+import { dirname, join } from "node:path"
 
 import { projectAgentPromptPath } from "./agents"
 import { log } from "./log"
-import { agentAliases, builtInAgents, builtInPipelines, humanReviewStep, splitModelVariant, type PipelineSpec, type StepSpec } from "./pipeline"
+import {
+  agentAliases,
+  builtInAgents,
+  builtInPipelines,
+  defaultGptModel,
+  defaultGptVariant,
+  humanReviewStep,
+  splitModelVariant,
+  type PipelineSpec,
+  type StepSpec,
+} from "./pipeline"
 import type { AgentSpec, PermissionAdditions } from "./types"
+import { archerHome, archerRoot } from "./workspace"
 
 /**
  * Project configuration loaded from .archer/config.yaml. Everything is
@@ -57,6 +68,52 @@ export async function loadArcherConfig(targetDir: string): Promise<ArcherConfig 
     return parseArcherConfig(body, `.archer/${fileName}`, targetDir)
   }
   return undefined
+}
+
+/**
+ * The per-user config at ~/.archer/config.yaml. Parsed with targetDir set to
+ * archerRoot() — the directory that holds `.archer` — so agent-prompt validation
+ * resolves to ~/.archer/agents/<name>.md, exactly like a project repo.
+ */
+export async function loadGlobalArcherConfig(): Promise<ArcherConfig | undefined> {
+  for (const fileName of configFileNames) {
+    const path = join(archerHome(), fileName)
+    let body: string
+    try {
+      body = await readFile(path, "utf8")
+    } catch {
+      continue
+    }
+    return parseArcherConfig(body, `~/.archer/${fileName}`, archerRoot())
+  }
+  return undefined
+}
+
+/**
+ * Merges the global config under the project one: project keys win on
+ * defaults/agents/pipelines (shallow, by key/name), and permissions/attachments
+ * concatenate (global first). deny still wins over allow in bashPolicy, so the
+ * concatenation order is irrelevant there.
+ */
+export function mergeArcherConfigs(global: ArcherConfig | undefined, project: ArcherConfig | undefined): ArcherConfig | undefined {
+  if (!global) return project
+  if (!project) return global
+  return {
+    defaults: { ...global.defaults, ...project.defaults },
+    agents: { ...global.agents, ...project.agents },
+    pipelines: { ...global.pipelines, ...project.pipelines },
+    permissions: {
+      allow: [...global.permissions.allow, ...project.permissions.allow],
+      deny: [...global.permissions.deny, ...project.permissions.deny],
+    },
+    attachments: [...global.attachments, ...project.attachments],
+  }
+}
+
+/** The effective config for a run: global merged under the project config. */
+export async function loadMergedArcherConfig(targetDir: string): Promise<ArcherConfig | undefined> {
+  const [global, project] = await Promise.all([loadGlobalArcherConfig(), loadArcherConfig(targetDir)])
+  return mergeArcherConfigs(global, project)
 }
 
 export function parseArcherConfig(body: string, source: string, targetDir: string): ArcherConfig {
@@ -220,6 +277,71 @@ export function selectPipelineSpec(config: ArcherConfig | undefined, name: strin
   throw new ConfigError(`unknown pipeline "${name}" (available: ${available.join(", ")})`)
 }
 
+/** True when a string is a valid `provider/model` or `provider/model#variant`. Shared by config validation and the config TUI. */
+export function isValidModelString(value: string): boolean {
+  if (typeof value !== "string" || !value.trim()) return false
+  try {
+    const { model } = splitModelVariant(value)
+    const provider = model.split("/")[0]
+    const rest = model.split("/").slice(1).join("/")
+    return Boolean(provider && rest)
+  } catch {
+    return false
+  }
+}
+
+/** Serializes a config back to YAML, omitting empty sections, with `version: 1` first. Comments are not preserved. */
+export function serializeArcherConfig(config: ArcherConfig): string {
+  const out: Record<string, unknown> = { version: 1 }
+  if (Object.keys(config.defaults).length > 0) out.defaults = config.defaults
+  if (Object.keys(config.agents).length > 0) out.agents = config.agents
+  if (Object.keys(config.pipelines).length > 0) out.pipelines = config.pipelines
+  const permissions: Record<string, string[]> = {}
+  if (config.permissions.allow.length > 0) permissions.allow = config.permissions.allow
+  if (config.permissions.deny.length > 0) permissions.deny = config.permissions.deny
+  if (Object.keys(permissions).length > 0) out.permissions = permissions
+  if (config.attachments.length > 0) out.attachments = config.attachments
+  return Bun.YAML.stringify(out, null, 2)
+}
+
+/** Serializes, validates by re-parsing, then writes. Never persists YAML that wouldn't load back. */
+export async function writeArcherConfig(path: string, config: ArcherConfig, targetDir: string): Promise<void> {
+  const body = serializeArcherConfig(config)
+  parseArcherConfig(body, path, targetDir)
+  await mkdir(dirname(path), { recursive: true })
+  await writeFile(path, body, "utf8")
+}
+
+/**
+ * Boilerplate written by the config TUI's "initialize" action: the current
+ * effective defaults plus the built-in `default` pipeline expanded so it stays
+ * editable. Agent model preferences that differ from defaults.model are inlined
+ * on their steps, because defaults.model would otherwise shadow them.
+ */
+export function defaultConfigTemplate(): ArcherConfig {
+  const globalModel = `${defaultGptModel}#${defaultGptVariant}`
+  return {
+    defaults: { model: globalModel, maxAttempts: 2 },
+    agents: {},
+    pipelines: { default: templatePipeline(builtInPipelines.default!, globalModel) },
+    permissions: { allow: [], deny: [] },
+    attachments: [],
+  }
+}
+
+function templatePipeline(spec: PipelineSpec, globalModel: string): PipelineSpec {
+  const steps = spec.steps.map<StepSpec>((raw) => {
+    const step = typeof raw === "string" ? { agent: raw } : { ...raw }
+    if (step.agent === humanReviewStep) return step.agent
+    const agent = builtInAgents.find((candidate) => candidate.name === (agentAliases[step.agent] ?? step.agent))
+    const preferred = agent?.defaultModel
+    const withModel = preferred && preferred !== globalModel ? { ...step, model: preferred } : step
+    // Collapse a bare { agent } back to its string shorthand for clean YAML.
+    return Object.keys(withModel).length === 1 ? withModel.agent : withModel
+  })
+  return { ...(spec.description ? { description: spec.description } : {}), steps }
+}
+
 class Validator {
   constructor(private readonly source: string) {}
 
@@ -261,12 +383,7 @@ class Validator {
 
   model(value: unknown, path: string): string {
     const text = this.nonEmptyString(value, path)
-    try {
-      const { model } = splitModelVariant(text)
-      if (!model.split("/")[0] || !model.split("/").slice(1).join("/")) throw new Error("missing provider or model")
-    } catch {
-      this.fail(path, `must look like provider/model or provider/model#variant, got "${text}"`)
-    }
+    if (!isValidModelString(text)) this.fail(path, `must look like provider/model or provider/model#variant, got "${text}"`)
     return text
   }
 

@@ -1,7 +1,7 @@
 import { readFile } from "node:fs/promises"
 import { resolve } from "node:path"
 
-import { buildAgentRegistry, loadArcherConfig, selectPipelineSpec, type ArcherDefaults } from "./config"
+import { buildAgentRegistry, loadMergedArcherConfig, selectPipelineSpec, type ArcherDefaults } from "./config"
 import { defaultGptModel, defaultGptVariant, defaultPipeline, resolvePipeline, splitModelVariant, validateStepFilters } from "./pipeline"
 import { parseModel, run } from "./runner"
 import { browseRuns } from "./runs"
@@ -41,6 +41,7 @@ export type CliCommand =
   | { type: "help"; text: string }
   | { type: "run"; options: RunOptions }
   | { type: "runs"; runID?: string }
+  | { type: "config"; targetDir: string }
 
 export async function parseAndRun(argv: string[]) {
   const command = await parseCommand(argv)
@@ -51,6 +52,12 @@ export async function parseAndRun(argv: string[]) {
   if (command.type === "runs") {
     const resolution = await browseRuns(command.runID)
     if (resolution.type === "resume") await run(await resumeOptions(resolution.runID, resolution.targetDir))
+    return
+  }
+  if (command.type === "config") {
+    // Imported lazily so normal runs never pull in the opentui editor.
+    const { editConfigTui } = await import("./config-tui")
+    await editConfigTui({ targetDir: command.targetDir })
     return
   }
 
@@ -72,6 +79,10 @@ export async function parseCommand(argv: string[]): Promise<CliCommand> {
     if (rest.length > 1) throw new Error("usage: archer runs [run-id]")
     if (rest[0] !== undefined && !isValidRunID(rest[0])) throw new Error(`invalid run id: ${rest[0]}`)
     return { type: "runs", runID: rest[0] }
+  }
+  if (argv[0] === "config") {
+    if (argv.length > 1) throw new Error("usage: archer config")
+    return { type: "config", targetDir: process.cwd() }
   }
 
   const parsed = parseArgs(argv)
@@ -98,7 +109,7 @@ export async function parseCommand(argv: string[]): Promise<CliCommand> {
 
 /** Applies the precedence chain and resolves the pipeline the run will execute. */
 export async function resolveRunOptions(parsed: ParsedArgs): Promise<Omit<RunOptions, "prompt">> {
-  const config = await loadArcherConfig(parsed.targetDir)
+  const config = await loadMergedArcherConfig(parsed.targetDir)
   const defaults = config?.defaults ?? {}
 
   const humanReview = parsed.humanReview ?? Boolean(process.stdin.isTTY && process.stdout.isTTY)
@@ -301,10 +312,12 @@ Usage:
   archer --prompt-file prd.md --file lib/onboarding --file test/onboarding_test.dart
   archer --pipeline bug-fix --prompt-file bug.md
   archer runs [run-id]
+  archer config
 
 Commands:
   runs [run-id]            Browse run history: resume a run, read its summary/reports,
                            or open a subshell in its run dir (under ~/.archer/runs)
+  config                   View and edit the global (~/.archer) and current project config in a TUI
 
 Flags:
   --prompt-file <path>     Read the PRD/prompt from a file
@@ -338,6 +351,7 @@ Project config (.archer/config.yaml):
   pipelines:               named step lists mixing agents and human-review gates
   permissions:             allow/deny additions to the bash policy (deny always wins)
   attachments:             files attached to every step
-  CLI flags always win over config defaults.
+  The same schema lives globally at ~/.archer/config.yaml; project config merges on top.
+  Precedence: CLI flags > project config > global config > built-in defaults.
 `
 }

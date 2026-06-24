@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url"
 import type { AgentConfig, Config } from "@opencode-ai/sdk/v2"
 import { builtInAgents } from "./pipeline"
 import type { AgentSpec, PermissionAdditions } from "./types"
+import { globalAgentsDir } from "./workspace"
 
 const sourceDir = dirname(fileURLToPath(import.meta.url))
 const builtInPromptsDir = join(sourceDir, "..", "prompts")
@@ -33,7 +34,8 @@ export function opencodeConfig(
 }
 
 export function loadAgentPrompt(agentName: string, targetDir = process.cwd()) {
-  const agentPrompt = readProjectAgentPrompt(agentName, targetDir) ?? readBuiltInPrompt(agentName)
+  // Precedence mirrors config merge: project override > global override > built-in.
+  const agentPrompt = readProjectAgentPrompt(agentName, targetDir) ?? readGlobalAgentPrompt(agentName) ?? readBuiltInPrompt(agentName)
   const safetyPrompt = readBuiltInPrompt(runtimeSafetyPrompt)
   return [agentPrompt.trimEnd(), "", "---", "", safetyPrompt.trim()].join("\n")
 }
@@ -48,6 +50,12 @@ export function builtInPromptPath(promptName: string) {
 
 function readProjectAgentPrompt(agentName: string, targetDir: string) {
   const path = projectAgentPromptPath(agentName, targetDir)
+  if (!isFile(path)) return undefined
+  return readFileSync(path, "utf8")
+}
+
+function readGlobalAgentPrompt(agentName: string) {
+  const path = join(globalAgentsDir(), `${agentName}.md`)
   if (!isFile(path)) return undefined
   return readFileSync(path, "utf8")
 }
