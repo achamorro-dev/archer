@@ -1,7 +1,7 @@
 import { readFile } from "node:fs/promises"
 import { resolve } from "node:path"
 
-import { buildAgentRegistry, loadMergedArcherConfig, selectPipelineSpec, type ArcherDefaults } from "./config"
+import { buildAgentRegistry, loadMergedArcherConfig, selectPipelineSpec, writeDefaultGlobalConfig, writeDefaultProjectConfig, type ArcherDefaults } from "./config"
 import { defaultGptModel, defaultGptVariant, defaultPipeline, resolvePipeline, splitModelVariant, validateStepFilters } from "./pipeline"
 import { parseModel, run } from "./runner"
 import { browseRuns } from "./runs"
@@ -37,11 +37,19 @@ export type ParsedArgs = {
   yolo?: boolean
 }
 
+export type InitOptions = {
+  targetDir: string
+  global: boolean
+  force: boolean
+  quiet: boolean
+}
+
 export type CliCommand =
   | { type: "help"; text: string }
   | { type: "run"; options: RunOptions }
   | { type: "runs"; runID?: string }
   | { type: "config"; targetDir: string }
+  | { type: "init"; options: InitOptions }
 
 export async function parseAndRun(argv: string[]) {
   const command = await parseCommand(argv)
@@ -58,6 +66,16 @@ export async function parseAndRun(argv: string[]) {
     // Imported lazily so normal runs never pull in the opentui editor.
     const { editConfigTui } = await import("./config-tui")
     await editConfigTui({ targetDir: command.targetDir })
+    return
+  }
+  if (command.type === "init") {
+    const result = command.options.global
+      ? await writeDefaultGlobalConfig(command.options.force)
+      : await writeDefaultProjectConfig(command.options.targetDir, command.options.force)
+    if (!command.options.quiet) {
+      const scope = command.options.global ? "global config" : "project config"
+      process.stdout.write(`${result.created ? "created" : "ensured"} ${scope}: ${result.path}\n`)
+    }
     return
   }
 
@@ -84,6 +102,11 @@ export async function parseCommand(argv: string[]): Promise<CliCommand> {
     if (argv.length > 1) throw new Error("usage: archer config")
     return { type: "config", targetDir: process.cwd() }
   }
+  if (argv[0] === "init") {
+    const parsed = parseInitArgs(argv.slice(1))
+    if (parsed.help) return { type: "help", text: initHelp() }
+    return { type: "init", options: parsed }
+  }
 
   const parsed = parseArgs(argv)
   if (parsed.help) return { type: "help", text: help() }
@@ -105,6 +128,63 @@ export async function parseCommand(argv: string[]): Promise<CliCommand> {
   }
 
   return { type: "run", options: { ...(await resolveRunOptions(parsed)), prompt } }
+}
+
+type ParsedInitArgs = InitOptions & { help?: boolean }
+
+function parseInitArgs(argv: string[]): ParsedInitArgs {
+  const parsed: ParsedInitArgs = {
+    targetDir: process.cwd(),
+    global: false,
+    force: false,
+    quiet: false,
+  }
+  let hasDir = false
+
+  for (let i = 0; i < argv.length; i++) {
+    const raw = argv[i]!
+    if (!raw.startsWith("-")) throw new Error("usage: archer init [--global] [--force] [--dir <path>]")
+
+    const { flag, value } = splitFlag(raw)
+    const noValue = () => {
+      if (value !== undefined) throw new Error(`${flag} does not take a value`)
+    }
+    const takeValue = () => {
+      if (value !== undefined) return value
+      const next = argv[++i]
+      if (next === undefined || (next.startsWith("-") && next !== "-")) throw new Error(`${flag} requires a value`)
+      return next
+    }
+
+    switch (flag) {
+      case "--help":
+      case "-h":
+        noValue()
+        parsed.help = true
+        return parsed
+      case "--global":
+        noValue()
+        parsed.global = true
+        break
+      case "--force":
+        noValue()
+        parsed.force = true
+        break
+      case "--quiet":
+        noValue()
+        parsed.quiet = true
+        break
+      case "--dir":
+        parsed.targetDir = resolve(process.cwd(), takeValue())
+        hasDir = true
+        break
+      default:
+        throw new Error(`unknown init flag: ${flag}`)
+    }
+  }
+
+  if (parsed.global && hasDir) throw new Error("use either --global or --dir, not both")
+  return parsed
 }
 
 /** Applies the precedence chain and resolves the pipeline the run will execute. */
@@ -311,10 +391,13 @@ Usage:
   archer "Add onboarding"
   archer --prompt-file prd.md --file lib/onboarding --file test/onboarding_test.dart
   archer --pipeline bug-fix --prompt-file bug.md
+  archer init
   archer runs [run-id]
   archer config
 
 Commands:
+  init                     Create .archer/config.yaml and .archer/agents/*.md in the target repo
+  init --global            Create ~/.archer/config.yaml and ~/.archer/agents/*.md
   runs [run-id]            Browse run history: resume a run, read its summary/reports,
                            or open a subshell in its run dir (under ~/.archer/runs)
   config                   View and edit the global (~/.archer) and current project config in a TUI
@@ -345,13 +428,31 @@ Flags:
   --base <ref>             Branch/base for calculating diffs (default: main)
   --dir <path>             Target repo (default: cwd)
 
-Project config (.archer/config.yaml):
+Config files:
+  ~/.archer/config.yaml    user defaults, created by make install or archer init --global
+  .archer/config.yaml      project-local overrides, created by archer init
+  agents/*.md              Markdown prompts loaded by matching the agent name
+
+Config keys:
   defaults:                model, maxAttempts, baseRef, pipeline, appRunCommand, emulator, interactiveModel
-  agents:                  project agents (prompt at .archer/agents/<name>.md) or built-in overrides
+  agents:                  project agents or built-in overrides; prompts live at agents/<name>.md
   pipelines:               named step lists mixing agents and human-review gates
   permissions:             allow/deny additions to the bash policy (deny always wins)
   attachments:             files attached to every step
   The same schema lives globally at ~/.archer/config.yaml; project config merges on top.
   Precedence: CLI flags > project config > global config > built-in defaults.
+`
+}
+
+function initHelp() {
+  return `archer init [--global] [--force] [--dir <path>]
+
+Create Archer's default config file and agent prompt Markdown files. Existing files are not overwritten unless --force is set.
+
+Options:
+  --global                 Write ~/.archer/config.yaml instead of a project config
+  --dir <path>             Target repo for .archer/config.yaml (default: cwd)
+  --force                  Overwrite an existing config file
+  --quiet                  Suppress status output
 `
 }

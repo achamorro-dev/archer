@@ -56,7 +56,7 @@ bun install
 make install
 ```
 
-This leaves `archer` in `~/.local/bin/archer`. Make sure it's in your `PATH`.
+This leaves `archer` in `~/.local/bin/archer` and creates `~/.archer/config.yaml` plus `~/.archer/agents/*.md` with Archer's default configuration if they do not already exist. Make sure `~/.local/bin` is in your `PATH`.
 
 ## Usage
 
@@ -113,6 +113,15 @@ archer runs 20260519-103045-x7q2
 # two tabs (Global / Project), pick models with autocomplete, edit pipelines
 # and steps, or initialize a starter config when none exists.
 archer config
+
+# create project-local config and prompt files you can customize
+archer init
+
+# create global defaults (~/.archer) instead of project-local
+archer init --global
+
+# overwrite an existing config file
+archer init --force
 
 # auto-allow ask-level permissions (the hard denylist still applies)
 archer --prompt-file prd.md --yolo
@@ -242,6 +251,19 @@ Both files are merged before a run, with the project winning: `defaults`, `agent
 
 Keys: `↑/↓` move, `enter` edit/expand, `tab` switch tab, `a` add, `d` delete a step, `shift+↑/↓` reorder a step, `t` agent temperature, `m` step max-attempts, `s` save the active tab, `q` quit. Saving re-validates and rewrites clean YAML (comments are not preserved); the dashboard never paints backgrounds, like the run TUIs. Needs an interactive terminal.
 
+## Initializing config files (`archer init`)
+
+`archer config` is interactive; `archer init` is its non-interactive counterpart: it writes a commented starter config and copies the built-in agent prompts so you can customize them in place.
+
+```bash
+archer init                # .archer/config.yaml + .archer/agents/*.md in the current repo
+archer init --dir ../app   # same, in another repo
+archer init --global       # ~/.archer/config.yaml + ~/.archer/agents/*.md
+archer init --force        # overwrite existing files
+```
+
+The generated config documents every key (commented out) and inlines the built-in `default` pipeline so it's immediately editable. The copied `agents/*.md` prompts are picked up by name — edit them to override a built-in agent's prompt, or declare a new agent in the config and add its prompt file. Existing files are never overwritten unless `--force` is given. `make install` runs `archer init --global` automatically, so a fresh install ships with a ready-to-edit global config.
+
 ## Project Context And Custom Agents
 
 Archer automatically attaches these target-repo files to every phase when they exist:
@@ -265,7 +287,7 @@ Built-in agent prompts live as Markdown files under `prompts/`. A project can fu
     └── api-reviewer.md  # prompt for a project agent declared in config.yaml
 ```
 
-When a project override exists, it replaces that agent's built-in prompt completely. Project agents declared in `config.yaml` must bring their prompt at `.archer/agents/<name>.md` (validated at startup). In both cases Archer still appends its non-replaceable runtime safety guard rails from `prompts/runtime-safety.md`.
+When a project override exists, it replaces that agent's built-in prompt completely. Project agents declared in `config.yaml` must bring their prompt at `.archer/agents/<name>.md` (validated at startup). The same convention applies globally: `~/.archer/agents/<name>.md` overrides a built-in for every repo. Prompt precedence is `.archer/agents/<name>.md` (project) > `~/.archer/agents/<name>.md` (global) > the built-in prompt. In all cases Archer still appends its non-replaceable runtime safety guard rails from `prompts/runtime-safety.md`.
 
 ## Efficient Attachments
 
@@ -305,7 +327,7 @@ Each invocation creates `~/.archer/runs/<run-id>/`:
 
 The run dir is deleted on successful completion unless `--keep-run-dir`. If it fails, it's preserved for inspecting reports, diffs, and logs.
 
-The target repo only sees commits with prefix `archer(<phase>): ...`, made on the current branch. No CLI files are left in the project.
+The target repo only sees commits with prefix `archer(<phase>): ...`, made on the current branch. Normal runs leave no CLI files in the project; `archer init` intentionally creates `.archer/config.yaml` when you want project-local configuration.
 
 ## Development
 

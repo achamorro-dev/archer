@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
@@ -16,8 +16,10 @@ import {
   parseArcherConfig,
   selectPipelineSpec,
   serializeArcherConfig,
+  writeDefaultArcherConfig,
+  writeDefaultProjectConfig,
 } from "../src/config"
-import { defaultGptModel, defaultGptVariant, defaultOpusModel } from "../src/pipeline"
+import { builtInAgents, defaultGptModel, defaultGptVariant, defaultOpusModel } from "../src/pipeline"
 
 const dirs: string[] = []
 
@@ -280,5 +282,74 @@ describe("global config", () => {
     const project = await projectDir("defaults:\n  maxAttempts: 2\n")
     const merged = await loadMergedArcherConfig(project)
     expect(merged?.defaults).toEqual({ model: "openai/gpt-5.5#xhigh", maxAttempts: 2 })
+  })
+})
+
+describe("default config init", () => {
+  test("the default config template is valid and explicit", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "archer-default-config-"))
+    dirs.push(dir)
+    const path = join(dir, "config.yaml")
+    await writeDefaultArcherConfig(path)
+
+    const body = await readFile(path, "utf8")
+    const config = parseArcherConfig(body, path, dir)
+
+    expect(body).toContain("# maxAttempts: 2")
+    expect(body).toContain("# baseRef: main")
+    expect(body).toContain("# pipeline: default")
+    expect(body).toContain("# interactiveModel: openai/gpt-5.5#xhigh")
+    expect(body).toContain("# appRunCommand: pnpm dev")
+    expect(body).toContain("# agents:")
+    expect(body).toContain("#   implementer:")
+    expect(body).toContain("#   design-polisher:")
+    expect(body).toContain("#   api-reviewer:")
+    expect(config.defaults).toEqual({})
+    expect(config.agents).toEqual({})
+    for (const agent of builtInAgents) {
+      expect(await readFile(join(dir, "agents", `${agent.name}.md`), "utf8")).toContain("#")
+    }
+    expect(config.pipelines.default?.steps).toEqual([
+      { agent: "implementer", reports: "none" },
+      "human-review",
+      "patterns",
+      "security",
+      "design",
+      { agent: "tests", reports: "none" },
+      { agent: "adversarial", reports: "all" },
+    ])
+    expect(config.permissions).toEqual({ allow: [], deny: [] })
+    expect(config.attachments).toEqual([])
+  })
+
+  test("writes default config without overwriting unless forced", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "archer-config-write-"))
+    dirs.push(dir)
+    const path = join(dir, "config.yaml")
+
+    expect(await writeDefaultArcherConfig(path)).toEqual({ path, created: true })
+    expect(await readFile(path, "utf8")).toContain("version: 1")
+    expect(await readFile(join(dir, "agents", "implementer.md"), "utf8")).toContain("# Implementer")
+
+    await writeFile(path, "version: 1\nattachments:\n  - custom.md\n")
+    await writeFile(join(dir, "agents", "implementer.md"), "# Custom Implementer\n")
+    expect(await writeDefaultArcherConfig(path)).toEqual({ path, created: false })
+    expect(await readFile(path, "utf8")).toContain("custom.md")
+    expect(await readFile(join(dir, "agents", "implementer.md"), "utf8")).toContain("# Custom Implementer")
+
+    expect(await writeDefaultArcherConfig(path, true)).toEqual({ path, created: true })
+    expect(await readFile(path, "utf8")).not.toContain("custom.md")
+    expect(await readFile(join(dir, "agents", "implementer.md"), "utf8")).toContain("# Implementer")
+  })
+
+  test("writes project default config under .archer", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "archer-project-config-"))
+    dirs.push(dir)
+    const path = join(dir, ".archer", "config.yaml")
+
+    expect(await writeDefaultProjectConfig(dir)).toEqual({ path, created: true })
+    expect(await writeDefaultProjectConfig(dir)).toEqual({ path, created: false })
+    expect(await readFile(path, "utf8")).toContain("pipelines:")
+    expect(await readFile(join(dir, ".archer", "agents", "implementer.md"), "utf8")).toContain("# Implementer")
   })
 })
