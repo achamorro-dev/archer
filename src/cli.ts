@@ -60,9 +60,24 @@ export async function parseAndRun(argv: string[]) {
     return
   }
   if (command.type === "runs") {
-    const resolution = await browseRuns(command.runID)
-    if (resolution.type === "resume") await run(await resumeOptions(resolution.runID, resolution.targetDir))
-    return
+    // The browser can open a run's dashboard and come back, so loop until the
+    // user resumes (which hands off to a real run) or quits.
+    let initialRunID = command.runID
+    for (;;) {
+      const resolution = await browseRuns(initialRunID)
+      if (resolution.type === "resume") {
+        await run(await resumeOptions(resolution.runID, resolution.targetDir))
+        return
+      }
+      if (resolution.type === "open") {
+        // Lazily imported: attaching pulls in the dashboard + opencode client.
+        const { openRunDashboard } = await import("./attach")
+        await openRunDashboard(resolution.runID)
+        initialRunID = resolution.runID
+        continue
+      }
+      return
+    }
   }
   if (command.type === "config") {
     // Imported lazily so normal runs never pull in the opentui editor.

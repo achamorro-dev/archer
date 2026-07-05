@@ -13,7 +13,7 @@ import {
 } from "@opentui/core"
 
 import { log } from "./log"
-import { openOpencodeSessionWindow } from "./opencode"
+import { openOpencodeSessionWindow, openStoredSessionWindow } from "./opencode"
 import { PhaseUsage, addTokens, emptyTokens } from "./usage"
 import {
   formatAgo,
@@ -152,6 +152,9 @@ export async function createTuiProgress(
   phases: readonly ProgressPhase[],
   onAbort?: () => void,
   autoAccept?: AutoAccept,
+  // Re-opened finished runs have no live server, so [o] opens their stored
+  // sessions from disk instead of attaching. Live runs/attaches leave this off.
+  options?: { offlineSessions?: boolean },
 ): Promise<ProgressUI> {
   // No backgroundColor yet: the palette is only chosen after the terminal
   // answers the background query, so a light terminal never flashes dark.
@@ -163,7 +166,7 @@ export async function createTuiProgress(
   })
   const mode = await renderer.waitForThemeMode(1_000).catch(() => null)
   setTheme(paletteForTerminal(mode, terminalBackgroundHex(renderer)))
-  return new TuiProgress(renderer, phases, onAbort, autoAccept)
+  return new TuiProgress(renderer, phases, onAbort, autoAccept, options?.offlineSessions ?? false)
 }
 
 export class TuiProgress implements ProgressUI {
@@ -352,6 +355,9 @@ export class TuiProgress implements ProgressUI {
     phases: readonly ProgressPhase[],
     private readonly onAbort?: () => void,
     private readonly autoAccept?: AutoAccept,
+    // When true (a re-opened finished run), [o] opens the phase's stored
+    // session from disk rather than attaching to a (nonexistent) live server.
+    private readonly offlineSessions = false,
   ) {
     this.phases = phases.map((phase) => ({
       ...phase,
@@ -996,19 +1002,27 @@ export class TuiProgress implements ProgressUI {
   private openSessionWindowForPhase(name: string, source: "click" | "key") {
     const phase = this.findPhase(name)
     if (!phase) return
-    if (!this.serverUrl) {
-      this.addEvent("archer", "system", "opencode server is not ready yet")
-      this.render()
-      return
-    }
     if (!phase.sessionID) {
       this.addEvent("archer", "system", `no opencode session for ${name} yet`)
       this.render()
       return
     }
+    // A live server (this run, or a live attach) → attach to it; a re-opened
+    // finished run → open the stored session standalone from disk.
+    const targetDir = this.targetDir || process.cwd()
+    const open = this.serverUrl
+      ? openOpencodeSessionWindow({ url: this.serverUrl, targetDir, sessionID: phase.sessionID })
+      : this.offlineSessions
+        ? openStoredSessionWindow({ targetDir, sessionID: phase.sessionID })
+        : undefined
+    if (!open) {
+      this.addEvent("archer", "system", "opencode server is not ready yet")
+      this.render()
+      return
+    }
 
     this.addEvent("archer", "system", `${source === "key" ? "[o]" : "click"}: opening ${name} session ${shortID(phase.sessionID)}`)
-    openOpencodeSessionWindow({ url: this.serverUrl, targetDir: this.targetDir || process.cwd(), sessionID: phase.sessionID })
+    open
       .then((backend) => {
         this.addEvent("archer", "system", `${name} session opened in ${backend}`)
         this.render()

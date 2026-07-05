@@ -32,6 +32,12 @@ export async function startOpencode(config: Config, signal?: AbortSignal): Promi
   }
 }
 
+// A client for an opencode server already running elsewhere (a live run's
+// server), so `archer runs` can attach and mirror its event stream.
+export function connectOpencode(url: string): OpencodeClient {
+  return createOpencodeClient({ baseUrl: url, fetch: fetchWithoutIdleTimeout as typeof fetch })
+}
+
 // Bun kills fetch sockets that stay quiet for 5 minutes by default; the SSE
 // event stream must outlive that during long tool runs. Bun honors the
 // non-standard `timeout: false` since 1.1; on older versions it's ignored,
@@ -51,14 +57,28 @@ export async function openOpencodeSessionWindow(input: {
   targetDir: string
   sessionID: string
 }): Promise<SessionWindowBackend> {
+  return openSessionCommand(
+    ["opencode", "attach", input.url, "--dir", input.targetDir, "--session", input.sessionID].map(shellQuote).join(" "),
+  )
+}
+
+// Opens a standalone opencode TUI on a stored session — it starts its own
+// server and reads the session from disk — for runs whose live server is gone
+// (so `[o]` in a re-opened finished-run dashboard still works).
+export async function openStoredSessionWindow(input: {
+  targetDir: string
+  sessionID: string
+}): Promise<SessionWindowBackend> {
+  return openSessionCommand(["opencode", input.targetDir, "--session", input.sessionID].map(shellQuote).join(" "))
+}
+
+async function openSessionCommand(coreCommand: string): Promise<SessionWindowBackend> {
   if (process.platform !== "darwin") {
     throw new Error("opening a new OpenCode terminal window is currently implemented for macOS only")
   }
 
-  const command = [
-    process.env.PATH ? `export PATH=${shellQuote(process.env.PATH)}:$PATH` : "",
-    ["opencode", "attach", input.url, "--dir", input.targetDir, "--session", input.sessionID].map(shellQuote).join(" "),
-  ]
+  // A login shell keeps the user's PATH for `opencode`.
+  const command = [process.env.PATH ? `export PATH=${shellQuote(process.env.PATH)}:$PATH` : "", coreCommand]
     .filter(Boolean)
     .join("; ")
 

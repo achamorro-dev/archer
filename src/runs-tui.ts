@@ -250,6 +250,12 @@ class RunsBrowser {
         break
       case "return":
       case "linefeed":
+      case "o": {
+        // Re-enter the run's dashboard: attach if it's live, else inspect it.
+        const run = this.selectedRun()
+        this.finish({ type: "open", runID: run.runID, targetDir: run.targetDir })
+        break
+      }
       case "r": {
         const run = this.selectedRun()
         this.finish({ type: "resume", runID: run.runID, targetDir: run.targetDir })
@@ -456,18 +462,22 @@ class RunsBrowser {
   private runRow(run: RunEntry, selected: boolean, width: number) {
     const style = runStatusStyles[run.statusKind]
     const cost = run.cost !== undefined ? formatMoney(run.cost) : "—"
+    // A live run reads as "running" with a green ● regardless of how many
+    // phases have finished so far, so it stands out as attachable.
+    const statusLabel = run.live ? "running" : run.status
+    const statusColor = run.live ? theme.green : theme[style.color]
     const left: TextChunk[] = [
       selected ? fg(theme.accent)("▸ ") : raw("  "),
-      fg(theme[style.color])(style.icon),
+      run.live ? fg(theme.green)("●") : fg(theme[style.color])(style.icon),
       raw(" "),
       fg(selected ? theme.text : theme.dim)(formatRunDate(run).padEnd(dateColumnWidth)),
       raw("  "),
       fg(theme.dim)(cost.padStart(7)),
       raw("  "),
     ]
-    const status = fg(theme[style.color])(run.status)
+    const status = fg(statusColor)(statusLabel)
     // marker (2) + icon (2) + date + cost (9) + gaps; status keeps its column.
-    const titleWidth = Math.max(12, width - dateColumnWidth - 16 - run.status.length)
+    const titleWidth = Math.max(12, width - dateColumnWidth - 16 - statusLabel.length)
     const title = truncate(run.title, titleWidth)
     left.push(selected ? bold(fg(theme.text)(title)) : fg(theme.text)(title))
     return padBetween(left, [status], width)
@@ -489,10 +499,11 @@ class RunsBrowser {
 
     const statusChunks: TextChunk[] = [
       fg(theme.faint)("status  "),
-      fg(theme[style.color])(`${style.icon} ${run.status}`),
+      run.live ? fg(theme.green)("● running") : fg(theme[style.color])(`${style.icon} ${run.status}`),
     ]
     if (run.cost !== undefined) statusChunks.push(fg(theme.faint)("  ·  "), fg(theme.green)(formatMoney(run.cost)))
     lines.push(new StyledText(statusChunks))
+    if (run.live) lines.push(new StyledText([fg(theme.faint)("        "), fg(theme.dim)("enter to attach live")]))
 
     lines.push(plain(""))
     lines.push(t`${fg(theme.faint)("─".repeat(Math.max(1, width)))}`)
@@ -529,11 +540,13 @@ class RunsBrowser {
     const left: TextChunk[] = [
       fg(theme.dim)("↑/↓ select · "),
       fg(theme.accent)("enter"),
-      fg(theme.dim)(" resume · "),
+      fg(theme.dim)(" open · "),
+      fg(theme.accent)("r"),
+      fg(theme.dim)("esume · "),
       fg(theme.accent)("s"),
       fg(theme.dim)("ummary · "),
       fg(theme.accent)("d"),
-      fg(theme.dim)("ir subshell · "),
+      fg(theme.dim)("ir · "),
       fg(theme.accent)("q"),
       fg(theme.dim)("uit"),
     ]
