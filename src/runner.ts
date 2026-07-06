@@ -257,7 +257,7 @@ export async function run(options: RunOptions) {
       await createProgressUI(progressPhases(pipeline), options.tui, () => shutdown.request("Ctrl+C"), autoAccept),
       metadata,
     )
-    progress.start(workspace.runID, options.targetDir)
+    progress.start(workspace.runID, options.targetDir, workspace.dir)
     log.info(`Run ${workspace.runID} - dir: ${workspace.dir}`)
     if (options.yolo) {
       progress.message("YOLO enabled: ask-level permissions will be auto-allowed (denylist still applies); shift+tab toggles")
@@ -355,6 +355,9 @@ export async function run(options: RunOptions) {
     removeSignalHandlers()
     if (shutdown.aborted) await shutdown.abortActiveSessions(progress)
     await permissions?.stop()
+    // The server dies at the end of this block; clear its metadata entry now so
+    // `archer runs` stops offering to attach to a run that's shutting down.
+    metadata?.serverStopped()
     await metadata?.flush().catch((error) => log.warn(`couldn't flush run metadata: ${String(error)}`))
     progress.stop()
     shutdown.dispose()
@@ -780,7 +783,7 @@ type SessionResult = {
   assistantInfos: AssistantMessage[]
 }
 
-type SessionWatcher = {
+export type SessionWatcher = {
   result: Promise<SessionResult>
   ready: Promise<void>
   stop(): Promise<void>
@@ -811,7 +814,7 @@ const maxConsecutivePollFailures = 10
 const reconnectBaseMs = 1_000
 const reconnectMaxMs = 15_000
 
-function watchSession(
+export function watchSession(
   client: OpencodeClient,
   input: {
     directory: string
@@ -1423,7 +1426,7 @@ function ensureAgentsAvailable(pipeline: Pipeline, agents: readonly AgentSpec[])
   }
 }
 
-function progressPhases(pipeline: Pipeline): ProgressPhase[] {
+export function progressPhases(pipeline: Pipeline): ProgressPhase[] {
   return pipeline.steps.map((step) =>
     step.type === "agent"
       ? {

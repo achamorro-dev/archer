@@ -1,3 +1,4 @@
+import { connect } from "node:net"
 import { readdir, readFile } from "node:fs/promises"
 import { join } from "node:path"
 import { stdin, stdout } from "node:process"
@@ -22,12 +23,21 @@ export type RunEntry = {
   targetDir?: string
   status: string
   statusKind: RunStatusKind
+  /** The run's opencode server is still up (its process is alive and the port answers): attach shows it live. */
+  live: boolean
+  /** The live server URL, present only when `live`. */
+  serverUrl?: string
   cost?: number
   createdAt?: number
   phases: RunPhaseInfo[]
 }
 
-export type RunsResolution = { type: "exit" } | { type: "resume"; runID: string; targetDir?: string }
+export type RunsResolution =
+  | { type: "exit" }
+  | { type: "resume"; runID: string; targetDir?: string }
+  // Re-enter a run's dashboard: attach to it live if its server is up, else
+  // reconstruct the finish screen from metadata + reports.
+  | { type: "open"; runID: string; targetDir?: string }
 
 export async function listRuns(root = runsRoot()): Promise<RunEntry[]> {
   let names: string[]
@@ -92,6 +102,7 @@ async function loadRunEntry(root: string, runID: string): Promise<RunEntry> {
   const dir = join(root, runID)
   const metadata = await readRunMetadata(join(dir, "metadata.json"))
   const summary = statusSummary(metadata)
+  const live = await isServerLive(metadata?.server)
   return {
     runID,
     dir,
@@ -99,10 +110,55 @@ async function loadRunEntry(root: string, runID: string): Promise<RunEntry> {
     targetDir: metadata?.targetDir,
     status: summary.label,
     statusKind: summary.kind,
+    live,
+    serverUrl: live ? metadata?.server?.url : undefined,
     cost: totalCost(metadata),
     createdAt: metadata?.createdAt,
     phases: phaseInfos(metadata),
   }
+}
+
+// A run is live if its recorded server process is still alive and its port
+// answers. The pid check is instant and rules out crashed runs (whose stale
+// server entry outlived them); the TCP probe confirms the port is really up
+// and guards against the rare pid reuse. Only runs that recorded a server —
+// and cleared it on clean shutdown — ever reach the probe.
+export async function isServerLive(server: RunMetadata["server"]): Promise<boolean> {
+  if (!server || !pidAlive(server.pid)) return false
+  return tcpReachable(server.url, 250)
+}
+
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    // EPERM: the process exists but belongs to another user — still alive.
+    return (error as NodeJS.ErrnoException).code === "EPERM"
+  }
+}
+
+function tcpReachable(url: string, timeoutMs: number): Promise<boolean> {
+  let host: string
+  let port: number
+  try {
+    const parsed = new URL(url)
+    host = parsed.hostname
+    port = Number(parsed.port) || (parsed.protocol === "https:" ? 443 : 80)
+  } catch {
+    return Promise.resolve(false)
+  }
+  return new Promise((resolve) => {
+    const socket = connect({ host, port })
+    const settle = (ok: boolean) => {
+      socket.destroy()
+      resolve(ok)
+    }
+    socket.setTimeout(timeoutMs)
+    socket.once("connect", () => settle(true))
+    socket.once("timeout", () => settle(false))
+    socket.once("error", () => settle(false))
+  })
 }
 
 async function runTitle(dir: string) {
@@ -151,13 +207,15 @@ function phaseInfos(metadata: RunMetadata | undefined): RunPhaseInfo[] {
 }
 
 function printRunList(runs: RunEntry[]) {
+  const statusText = (run: RunEntry) => (run.live ? "running" : run.status)
   const numberWidth = String(runs.length).length
-  const statusWidth = Math.max(...runs.map((run) => run.status.length))
+  const statusWidth = Math.max(...runs.map((run) => statusText(run).length))
   stdout.write(`\nruns in ${runsRoot()}:\n`)
   for (const [index, run] of runs.entries()) {
     const number = String(index + 1).padStart(numberWidth)
     const cost = (run.cost !== undefined ? `$${run.cost.toFixed(2)}` : "").padStart(8)
-    stdout.write(`  ${number}. ${run.runID}  ${run.status.padEnd(statusWidth)}  ${cost}  ${run.title}\n`)
+    const marker = run.live ? "●" : " "
+    stdout.write(`  ${number}. ${marker} ${run.runID}  ${statusText(run).padEnd(statusWidth)}  ${cost}  ${run.title}\n`)
   }
 }
 

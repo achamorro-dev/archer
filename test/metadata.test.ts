@@ -55,6 +55,23 @@ describe("run metadata", () => {
     expect(resumed.pipeline.steps).toHaveLength(1)
   })
 
+  test("records the live server and clears it on shutdown", async () => {
+    const ws = await workspace()
+    const store = await openRunMetadata(ws, "/repo", quick)
+
+    store.serverStarted("http://127.0.0.1:4096")
+    await store.flush()
+    let saved = await readRunMetadata(join(ws.dir, "metadata.json"))
+    expect(saved?.server?.url).toBe("http://127.0.0.1:4096")
+    expect(saved?.server?.pid).toBe(process.pid)
+
+    // Cleared on shutdown, so a lingering entry can only mean the run crashed.
+    store.serverStopped()
+    await store.flush()
+    saved = await readRunMetadata(join(ws.dir, "metadata.json"))
+    expect(saved?.server).toBeUndefined()
+  })
+
   test("persists as schemaVersion 2 and still reads v1 metadata", async () => {
     const ws = await workspace()
     const store = await openRunMetadata(ws, "/repo", quick)
