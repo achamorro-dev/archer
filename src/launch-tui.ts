@@ -764,7 +764,7 @@ function clamp(value: number, min: number, max: number) {
   return Math.max(min, Math.min(max, value))
 }
 
-function typedText(key: KeyEvent): string | undefined {
+export function typedText(key: KeyEvent): string | undefined {
   if (key.ctrl) return undefined
   const name = key.name
   if (name === "space") return " "
@@ -783,7 +783,7 @@ function typedText(key: KeyEvent): string | undefined {
   return out || undefined
 }
 
-function sanitizePaste(text: string): string {
+export function sanitizePaste(text: string): string {
   // Normalize CR/CRLF to LF (preserving line breaks), collapse tabs to a
   // single space so they don't desync the wrap/cursor column math, and
   // strip any remaining control bytes that some terminals leak outside
@@ -795,7 +795,7 @@ function sanitizePaste(text: string): string {
     .replace(/[\x00-\x08\x0b-\x1f\x7f]/g, "")
 }
 
-function wrapPromptLines(text: string, width: number): string[] {
+export function wrapPromptLines(text: string, width: number): string[] {
   if (width < 1) return [""]
   const result: string[] = []
   for (const line of text.split("\n")) {
@@ -808,7 +808,7 @@ function wrapPromptLines(text: string, width: number): string[] {
   return result.length ? result : [""]
 }
 
-function cursorPosition(text: string, cursor: number, width: number): { row: number; col: number } {
+export function cursorPosition(text: string, cursor: number, width: number): { row: number; col: number } {
   let row = 0
   let col = 0
   const end = Math.min(cursor, text.length)
