@@ -181,6 +181,9 @@ class LaunchPicker {
   private readonly detailText: TextRenderable
   private readonly detailBox: BoxRenderable
   private readonly footerText: TextRenderable
+  private readonly overlay: BoxRenderable
+  private readonly modalBox: BoxRenderable
+  private readonly modalText: TextRenderable
   private readonly paletteTargets: Array<{ box: BoxRenderable; background: PaletteColor; border?: PaletteColor }> = []
   private pipelineRows: (number | undefined)[] = []
   private optionRows: (number | undefined)[] = []
@@ -330,6 +333,37 @@ class LaunchPicker {
     shell.add(body)
     shell.add(footer.box)
     renderer.root.add(shell)
+
+    // Modals float over the whole canvas, matching config-tui/runs-tui: an
+    // absolute overlay centers a rounded accent-bordered box painted on
+    // theme.overlay so it masks the setup screen underneath.
+    this.overlay = new BoxRenderable(renderer, {
+      id: "archer-launch-overlay",
+      position: "absolute",
+      left: 0,
+      top: 0,
+      width: "100%",
+      height: "100%",
+      zIndex: 100,
+      alignItems: "center",
+      justifyContent: "center",
+      visible: false,
+    })
+    this.modalBox = new BoxRenderable(renderer, {
+      id: "archer-launch-modal",
+      border: true,
+      borderStyle: "rounded",
+      borderColor: theme.accent,
+      backgroundColor: theme.overlay,
+      titleAlignment: "left",
+      paddingX: 2,
+      paddingY: 1,
+    })
+    this.modalText = new TextRenderable(renderer, { content: "", fg: theme.text, width: "100%", height: "100%" })
+    this.modalBox.add(this.modalText)
+    this.overlay.add(this.modalBox)
+    renderer.root.add(this.overlay)
+    this.paletteTargets.push({ box: this.modalBox, background: "overlay", border: "accent" })
 
     renderer.keyInput.on("keypress", this.handleKeyPress)
     renderer.keyInput.on("paste", this.handlePaste)
@@ -602,7 +636,37 @@ class LaunchPicker {
     this.pipelineText.content = this.pipelineContent(pipelineWidth)
     this.detailText.content = this.detailContent(detailWidth - 4)
     this.footerText.content = this.footerContent(innerWidth)
+    this.renderModal()
     this.renderer.requestRender()
+  }
+
+  private renderModal() {
+    const modal = this.modal
+    this.overlay.visible = Boolean(modal)
+    if (!modal) return
+    const boxWidth = this.modalWidth()
+    const width = boxWidth - 6
+    const lines: StyledText[] = []
+
+    this.modalBox.title = ` ${truncate(modal.title, boxWidth - 8)} `
+    this.modalBox.borderColor = modal.kind === "message" ? theme.yellow : theme.accent
+
+    if (modal.kind === "loading") {
+      const frame = spinnerFrame(Date.now())
+      lines.push(new StyledText([fg(theme.accent)(frame), raw("  "), fg(theme.text)(truncate(modal.message, width - 3))]))
+    } else {
+      for (const line of wrapWords(modal.message, width)) lines.push(new StyledText([fg(theme.text)(line)]))
+    }
+    lines.push(plain(""))
+    lines.push(new StyledText([fg(theme.dim)(modal.kind === "message" ? "press any key to dismiss" : "creating a new branch + worktree…")]))
+
+    this.modalBox.width = boxWidth
+    this.modalBox.height = lines.length + 4
+    this.modalText.content = joinLines(lines)
+  }
+
+  private modalWidth() {
+    return Math.max(46, Math.min(80, this.renderer.width - 10))
   }
 
   private headerContent(width: number) {
@@ -651,7 +715,6 @@ class LaunchPicker {
   }
 
   private detailContent(width: number) {
-    if (this.modal) return this.modalContent(width)
     this.optionRows = []
     switch (this.mode) {
       case "pipelines":
@@ -661,27 +724,6 @@ class LaunchPicker {
       case "options":
         return this.optionsDetail(width)
     }
-  }
-
-  private modalContent(width: number) {
-    const modal = this.modal!
-    const lines: StyledText[] = []
-    lines.push(plain(""))
-    if (modal.kind === "loading") {
-      const frame = spinnerFrame(Date.now())
-      lines.push(new StyledText([fg(theme.accent)(frame), raw(" "), bold(fg(theme.text)(modal.title))]))
-    } else {
-      lines.push(new StyledText([bold(fg(theme.yellow)(modal.title))]))
-    }
-    lines.push(plain(""))
-    for (const line of wrapWords(modal.message, width)) lines.push(new StyledText([fg(theme.dim)(line)]))
-    lines.push(plain(""))
-    if (modal.kind === "message") {
-      lines.push(new StyledText([fg(theme.faint)("press any key to dismiss")]))
-    } else {
-      lines.push(new StyledText([fg(theme.faint)("creating a new branch + worktree…")]))
-    }
-    return joinLines(lines)
   }
 
   private pipelineDetail(width: number) {
@@ -857,11 +899,12 @@ function clamp(value: number, min: number, max: number) {
 }
 
 // A slider-style toggle: the knob (●) sits on the right when on, left when
-// off, with a colored track that reads as a single cell. Returns the chunks
-// so the caller can splice them into the row's left column.
+// off, over a colored track. The state label is padded to a fixed 3-cell
+// column so the labels that follow stay aligned across on/off rows. Returns
+// the chunks so the caller can splice them into the row's left column.
 function toggleSwitch(enabled: boolean): TextChunk[] {
   if (enabled) {
-    return [fg(theme.green)("━━●"), fg(theme.green)(bold(" on"))]
+    return [fg(theme.green)("━━●"), bold(fg(theme.green)(" on "))]
   }
   return [fg(theme.faint)("●━━"), fg(theme.dim)(" off")]
 }
