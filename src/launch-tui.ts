@@ -724,6 +724,10 @@ class LaunchPicker {
 
     this.pipelineBox.width = pipelineWidth
     this.detailBox.width = detailWidth
+    // Mirror the dashboard focus cue: the accented border marks where Enter,
+    // Esc, and the navigation keys apply in the current setup step.
+    this.pipelineBox.borderColor = this.mode === "pipelines" ? theme.accent : theme.borderDim
+    this.detailBox.borderColor = this.mode === "pipelines" ? theme.borderDim : theme.accent
     this.headerText.content = this.headerContent(innerWidth)
     // Panels reserve 4 cells of chrome (rounded border + paddingX:1 each side),
     // so lay out the rows against the inner text width — matching detailWidth
