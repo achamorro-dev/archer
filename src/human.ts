@@ -6,13 +6,13 @@ import { createInterface } from "node:readline/promises"
 
 import { addAllAndCommit } from "./git"
 import { log } from "./log"
-import { noopProgress, type ProgressUI } from "./progress"
+import { openInteractiveOpencodeWindow } from "./opencode"
+import { noopProgress, type HumanReviewAction, type ProgressUI } from "./progress"
 import type { PermissionGate } from "./permissions"
 import type { RunOptions } from "./types"
 import type { Workspace } from "./workspace"
 
 type AppProcess = ChildProcess
-type HumanAction = "continue" | "iterate" | "rerun" | "abort" | "prepare"
 
 export async function runHumanReviewGate(
   workspace: Workspace,
@@ -30,7 +30,8 @@ export async function runHumanReviewGate(
     return
   }
 
-  if (!stdin.isTTY || !stdout.isTTY) {
+  const askInTui = progress.askHumanReview?.bind(progress)
+  if (!askInTui && (!stdin.isTTY || !stdout.isTTY)) {
     progress.phaseSkipped(stepName)
     log.warn(`[${stepName}] skipped because stdin/stdout are not interactive`)
     return
@@ -46,15 +47,19 @@ export async function runHumanReviewGate(
 
   let iterations = 0
   let app: AppProcess | undefined
+  const inheritOutput = !askInTui
+  const askAction = async (initial = false) =>
+    askInTui
+      ? askInTui(humanReviewInfo(stepName, options, iterations, app))
+      : askHumanAction(initial ? { timeoutMs: 10_000, timeoutAction: "prepare" } : undefined)
 
-  // The whole gate runs with the TUI suspended: the readline prompts, the app
-  // command's inherited stdout, and the interactive OpenCode TUI all need the
-  // terminal to themselves.
-  progress.suspend()
+  // Plain readline fallback still owns the terminal. The TUI path keeps the
+  // dashboard active and resolves actions via ProgressUI.askHumanReview.
+  if (!askInTui) progress.suspend()
   try {
     log.section(`${stepName} - manual review checkpoint`)
-    log.info("choose an action now, or Archer will prepare the configured app command after 10 seconds")
-    let action = await askHumanAction({ timeoutMs: 10_000, timeoutAction: "prepare" })
+    if (!askInTui) log.info("choose an action now, or Archer will prepare the configured app command after 10 seconds")
+    let action = await askAction(true)
 
     for (;;) {
       if (action === "continue") {
@@ -66,26 +71,30 @@ export async function runHumanReviewGate(
 
       if (action === "prepare" || action === "rerun") {
         await stopApp(app)
-        app = await prepareApp(options, progress, stepName)
-        action = await askHumanAction()
+        app = await prepareApp(options, progress, stepName, { inheritOutput })
+        action = await askAction()
         continue
       }
 
       if (action === "iterate") {
         iterations++
-        await stopApp(app)
-        app = undefined
         progress.phaseRunning(stepName, "interactive OpenCode iteration")
-        // The interactive OpenCode TUI answers its own permission prompts;
-        // Archer's gate must not race it for the same requests.
-        permissions?.pause()
-        try {
-          await runInteractiveOpencode(options, opencodeUrl)
-        } finally {
-          permissions?.resume()
+        if (askInTui) {
+          await openExternalIteration(options, opencodeUrl, progress, stepName)
+        } else {
+          await stopApp(app)
+          app = undefined
+          // The interactive OpenCode TUI answers its own permission prompts;
+          // Archer's gate must not race it for the same requests.
+          permissions?.pause()
+          try {
+            await runInteractiveOpencode(options, opencodeUrl)
+          } finally {
+            permissions?.resume()
+          }
+          await commitHumanChanges(options)
         }
-        await commitHumanChanges(options)
-        action = "prepare"
+        action = await askAction()
         continue
       }
 
@@ -95,7 +104,7 @@ export async function runHumanReviewGate(
     }
   } finally {
     await stopApp(app)
-    progress.resume()
+    if (!askInTui) progress.resume()
   }
 }
 
@@ -108,14 +117,26 @@ async function humanReviewApproved(workspace: Workspace, stepName: string) {
   }
 }
 
-async function prepareApp(options: RunOptions, progress: ProgressUI, stepName: string): Promise<AppProcess | undefined> {
-  progress.phaseRunning(stepName, "preparing app")
-  await launchEmulator(options)
-  progress.phaseRunning(stepName, "running app command")
-  return startApp(options)
+function humanReviewInfo(stepName: string, options: RunOptions, iterations: number, app: AppProcess | undefined) {
+  return {
+    stepName,
+    iterations,
+    appRunning: Boolean(app && app.exitCode === null && app.signalCode === null),
+    appCommand: options.appRunCommand,
+    emulatorID: options.emulatorID,
+    interactiveModel: options.interactiveModel,
+    interactiveVariant: options.interactiveVariant,
+  }
 }
 
-async function launchEmulator(options: RunOptions) {
+async function prepareApp(options: RunOptions, progress: ProgressUI, stepName: string, io: { inheritOutput: boolean }): Promise<AppProcess | undefined> {
+  progress.phaseRunning(stepName, "preparing app")
+  await launchEmulator(options, io)
+  progress.phaseRunning(stepName, "running app command")
+  return startApp(options, progress, stepName, io)
+}
+
+async function launchEmulator(options: RunOptions, io: { inheritOutput: boolean }) {
   const emulatorID = options.emulatorID
   if (!emulatorID) {
     log.info("[human-review] no emulator configured; starting app command without launching one")
@@ -126,17 +147,18 @@ async function launchEmulator(options: RunOptions) {
   const proc = Bun.spawn(["flutter", "emulators", "--launch", emulatorID], {
     cwd: options.targetDir,
     stdin: "ignore",
-    stdout: "inherit",
-    stderr: "inherit",
+    stdout: io.inheritOutput ? "inherit" : "ignore",
+    stderr: io.inheritOutput ? "inherit" : "ignore",
     env: process.env,
   })
   const code = await proc.exited
   if (code !== 0) log.warn(`[human-review] emulator launch exited with code ${code}; start it manually if needed`)
 }
 
-function startApp(options: RunOptions): AppProcess | undefined {
+function startApp(options: RunOptions, progress: ProgressUI, stepName: string, io: { inheritOutput: boolean }): AppProcess | undefined {
   if (!options.appRunCommand) {
     log.warn("[human-review] app launch disabled; start the app manually before continuing")
+    progress.phaseActivity(stepName, "app launch disabled; start it manually", "info")
     return undefined
   }
 
@@ -145,13 +167,13 @@ function startApp(options: RunOptions): AppProcess | undefined {
   // whole tree (pnpm/flutter spawn the real servers as grandchildren).
   return spawn("sh", ["-c", options.appRunCommand], {
     cwd: options.targetDir,
-    stdio: ["ignore", "inherit", "inherit"],
+    stdio: io.inheritOutput ? ["ignore", "inherit", "inherit"] : ["ignore", "ignore", "ignore"],
     detached: true,
     env: process.env,
   })
 }
 
-async function askHumanAction(options: { timeoutMs?: number; timeoutAction?: HumanAction } = {}): Promise<HumanAction> {
+async function askHumanAction(options: { timeoutMs?: number; timeoutAction?: HumanReviewAction } = {}): Promise<HumanReviewAction> {
   const rl = createInterface({ input: stdin, output: stdout })
   const controller = new AbortController()
   let interrupted = false
@@ -194,6 +216,21 @@ async function askHumanAction(options: { timeoutMs?: number; timeoutAction?: Hum
   } finally {
     if (timeout) clearTimeout(timeout)
     rl.close()
+  }
+}
+
+async function openExternalIteration(options: RunOptions, opencodeUrl: string, progress: ProgressUI, stepName: string) {
+  progress.phaseActivity(stepName, "opening OpenCode iteration in a new window", "system")
+  try {
+    const backend = await openInteractiveOpencodeWindow({
+      url: opencodeUrl,
+      targetDir: options.targetDir,
+      model: options.interactiveModel,
+      variant: options.interactiveVariant,
+    })
+    progress.phaseActivity(stepName, `OpenCode iteration opened in ${backend}; return here and press c to continue`, "system")
+  } catch (error) {
+    progress.phaseActivity(stepName, `couldn't open OpenCode iteration: ${error instanceof Error ? error.message : String(error)}`, "error")
   }
 }
 

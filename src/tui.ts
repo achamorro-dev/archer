@@ -50,6 +50,8 @@ import type {
   PermissionReply,
   ProgressAttempt,
   ProgressDiffSummary,
+  HumanReviewAction,
+  HumanReviewPromptInfo,
   ProgressMessage,
   ProgressMessageChannel,
   ProgressPhase,
@@ -150,6 +152,11 @@ type PendingPermission = {
   resolve: (reply: PermissionReply) => void
 }
 
+type PendingHumanReview = {
+  info: HumanReviewPromptInfo
+  resolve: (action: HumanReviewAction) => void
+}
+
 // The post-run screen keeps the very same dashboard: the pipeline is still the
 // phase selector and the content panel still carries its logs/reports/session
 // tabs. Only the run is over, so it becomes frozen-in-time browsing.
@@ -225,6 +232,7 @@ export class TuiProgress implements ProgressUI {
   // Panels repainted when the terminal reports a theme change mid-run.
   private readonly paletteTargets: Array<{ box: BoxRenderable; background: PaletteColor; border?: PaletteColor }> = []
   private readonly permissionQueue: PendingPermission[] = []
+  private humanReview?: PendingHumanReview
   private permissionChoice = 0
   // Suspension nests: outer scopes (human-review gate) and inner prompts may
   // both suspend; only the outermost transition touches the renderer.
@@ -284,6 +292,7 @@ export class TuiProgress implements ProgressUI {
       this.handlePermissionKey(key)
       return
     }
+    if (this.humanReview && this.handleHumanReviewKey(key)) return
     // Everything else is navigation, shared by the live dashboard and the
     // finish screen: move the focused phase, switch the content tab, scroll a
     // report, or open the external session.
@@ -786,6 +795,17 @@ export class TuiProgress implements ProgressUI {
     })
   }
 
+  askHumanReview(info: HumanReviewPromptInfo): Promise<HumanReviewAction> {
+    if (this.renderer.isDestroyed) return Promise.resolve("abort")
+    return new Promise((resolve) => {
+      this.humanReview = { info, resolve }
+      this.selectPhaseByName(info.stepName)
+      this.manualFocus = false
+      this.addEvent(info.stepName, "permission", "waiting for human review action")
+      this.render()
+    })
+  }
+
   // Resolves when the user dismisses the screen (q/esc/ctrl+c). Until then the
   // run stays alive upstream: the opencode server keeps serving [o] and the
   // run dir keeps the reports readable.
@@ -928,6 +948,8 @@ export class TuiProgress implements ProgressUI {
     // A shutdown signal can tear the run down while the finish screen is still
     // up; resolving here keeps that promise from leaking.
     this.finished?.resolve()
+    this.humanReview?.resolve("abort")
+    this.humanReview = undefined
     for (const pending of this.permissionQueue.splice(0)) pending.resolve("reject")
     if (this.renderer.isDestroyed) return
     this.renderer.destroy()
@@ -1018,6 +1040,24 @@ export class TuiProgress implements ProgressUI {
     const verdict = reply === "once" ? "allowed once" : reply === "always" ? "always allowed" : "rejected"
     this.addEvent("archer", "permission", `${verdict}: ${permissionSummary(pending.info)}`)
     pending.resolve(reply)
+    this.render()
+  }
+
+  private handleHumanReviewKey(key: KeyEvent) {
+    const action = humanReviewActionForKey(key)
+    if (!action) return false
+    key.preventDefault()
+    key.stopPropagation()
+    this.resolveHumanReview(action)
+    return true
+  }
+
+  private resolveHumanReview(action: HumanReviewAction) {
+    const pending = this.humanReview
+    if (!pending) return
+    this.humanReview = undefined
+    this.addEvent(pending.info.stepName, action === "prepare" ? "step" : action === "abort" ? "error" : "permission", humanReviewActionLabel(action))
+    pending.resolve(action)
     this.render()
   }
 
@@ -1422,6 +1462,15 @@ export class TuiProgress implements ProgressUI {
     if (this.finished?.error && phase.status === "failed") {
       out.push(t`${fg(theme.red)(truncate(this.finished.error, Math.max(20, width)))}`)
     }
+    if (this.humanReview?.info.stepName === phase.name) {
+      out.push(plain(""))
+      out.push(new StyledText([fg(theme.yellow)("human review"), fg(theme.faint)(" · choose from the dashboard shortcuts")]))
+      out.push(new StyledText([fg(theme.accent)("c"), fg(theme.dim)(" continue pipeline   "), fg(theme.accent)("s"), fg(theme.dim)(" start app   "), fg(theme.accent)("r"), fg(theme.dim)(" rerun app")]))
+      out.push(new StyledText([fg(theme.accent)("i"), fg(theme.dim)(" open OpenCode iteration   "), fg(theme.accent)("a"), fg(theme.dim)(" abort")]))
+      const info = this.humanReview.info
+      const app = info.appCommand ? (info.appRunning ? "running" : "configured") : "disabled"
+      out.push(new StyledText([fg(theme.faint)("app "), fg(theme.dim)(app), fg(theme.faint)(" · iterations "), fg(theme.dim)(String(info.iterations))]))
+    }
     return out
   }
 
@@ -1604,6 +1653,24 @@ export class TuiProgress implements ProgressUI {
       return padBetween(left, right, width)
     }
 
+    if (this.humanReview) {
+      const left: TextChunk[] = [
+        fg(theme.yellow)("human review · "),
+        fg(theme.accent)("c"),
+        fg(theme.dim)(" continue · "),
+        fg(theme.accent)("s"),
+        fg(theme.dim)(" start app · "),
+        fg(theme.accent)("r"),
+        fg(theme.dim)(" rerun app · "),
+        fg(theme.accent)("i"),
+        fg(theme.dim)(" iterate · "),
+        fg(theme.accent)("a"),
+        fg(theme.dim)(" abort"),
+      ]
+      const right: TextChunk[] = [fg(theme.faint)(this.humanReview.info.appRunning ? "app running" : this.humanReview.info.appCommand ? "app configured" : "app disabled")]
+      return padBetween(left, right, width)
+    }
+
     const left: TextChunk[] = [
       fg(theme.dim)("["),
       fg(theme.accent)("↑↓"),
@@ -1689,6 +1756,37 @@ function statusWordChunk(phase: PhaseState, now: number): TextChunk {
       return fg(theme.faint)("skipped")
     default:
       return fg(theme.faint)("scheduled")
+  }
+}
+
+function humanReviewActionForKey(key: KeyEvent): HumanReviewAction | undefined {
+  switch (key.name) {
+    case "c":
+      return "continue"
+    case "s":
+      return "prepare"
+    case "r":
+      return "rerun"
+    case "i":
+      return "iterate"
+    case "a":
+      return "abort"
+  }
+  return undefined
+}
+
+function humanReviewActionLabel(action: HumanReviewAction) {
+  switch (action) {
+    case "continue":
+      return "human review: continue"
+    case "prepare":
+      return "human review: start app"
+    case "rerun":
+      return "human review: rerun app"
+    case "iterate":
+      return "human review: open OpenCode iteration"
+    case "abort":
+      return "human review: abort"
   }
 }
 
